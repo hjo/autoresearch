@@ -78,7 +78,9 @@ def generate_signals(data):
                 positions.loc[ref_index[i], t] = weight
         elif state == -1:
             positions.loc[ref_index[i], 'SPY'] = -1.00
-        # state 2 = all cash (positions already 0)
+        elif state == 2:
+            # Stopped out → go short SPY (smaller position than full bear)
+            positions.loc[ref_index[i], 'SPY'] = -0.50
 
     return positions
 
