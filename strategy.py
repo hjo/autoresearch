@@ -19,7 +19,7 @@ from prepare import (
 # Strategy parameters in TRADING DAYS (frequency-independent)
 FAST_SMA_DAYS = 7       # ~1.5 weeks
 SLOW_SMA_DAYS = 19      # ~1 month
-TRAILING_STOP = 0.03    # 3% from peak
+TRAILING_STOP = 0.05    # 5% from peak
 HYSTERESIS_UP = 1.015   # 1.5% buffer to enter bull
 HYSTERESIS_DN = 0.985   # 1.5% buffer to enter bear
 REENTRY_BAR = 1.02      # 2% buffer to re-enter after stop
