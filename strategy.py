@@ -16,10 +16,11 @@ from prepare import (
 
 def generate_signals(data):
     """
-    Bi-directional SPY regime.
-    - Bullish (50-SMA > 200-SMA): equal-weight long all stocks
-    - Bearish (50-SMA < 200-SMA): short SPY with 30% allocation
-    - Hysteresis to prevent whipsaws
+    SPY 50/200 regime + trailing stop.
+    - Bull: equal-weight long all stocks
+    - Bear: short SPY 100%
+    - Trailing stop: if SPY drops 3% from its high since regime entry, exit to cash
+    - Re-enter bull only when SMA crossover re-confirms
     """
     tickers = list(data.keys())
     stock_tickers = [t for t in tickers if t != 'SPY']
@@ -33,26 +34,51 @@ def generate_signals(data):
     spy_fast = spy_close.rolling(50).mean()
     spy_slow = spy_close.rolling(200).mean()
 
-    # Regime: 1 = bullish, -1 = bearish, 0 = warmup
-    regime = pd.Series(0, index=ref_index, dtype=int)
+    # State machine: 0=warmup, 1=bull, -1=bear, 2=stopped_out (waiting for re-entry)
     state = 0
-    for i in range(len(regime)):
+    spy_peak = 0.0  # track SPY high since bull entry
+
+    for i in range(len(ref_index)):
         f = spy_fast.iloc[i]
         s = spy_slow.iloc[i]
+        price = spy_close.iloc[i]
+
         if pd.isna(f) or pd.isna(s):
             continue
-        if state <= 0 and f > s * 1.005:
-            state = 1
-        elif state >= 0 and f < s * 0.995:
-            state = -1
-        regime.iloc[i] = state
 
-    # Bullish: long individual stocks
-    for ticker in stock_tickers:
-        positions[ticker] = (regime == 1).astype(float) * weight
+        if state == 1:  # In bull
+            spy_peak = max(spy_peak, price)
+            # Trailing stop: 3% drawdown from peak
+            if price < spy_peak * 0.97:
+                state = 2  # stopped out → cash
+                spy_peak = 0.0
+            elif f < s * 0.995:
+                state = -1  # regime turns bear
+                spy_peak = 0.0
+        elif state == -1:  # In bear
+            if f > s * 1.005:
+                state = 1
+                spy_peak = price
+        elif state == 2:  # Stopped out, waiting
+            # Re-enter only when SMA confirms bull
+            if f > s * 1.01:  # higher threshold to re-enter after stop
+                state = 1
+                spy_peak = price
+            elif f < s * 0.995:
+                state = -1
+        elif state == 0:  # Warmup
+            if f > s * 1.005:
+                state = 1
+                spy_peak = price
+            elif f < s * 0.995:
+                state = -1
 
-    # Bearish: short SPY with smaller allocation (hedge)
-    positions['SPY'] = (regime == -1).astype(float) * (-1.00)
+        if state == 1:
+            for t in stock_tickers:
+                positions.loc[ref_index[i], t] = weight
+        elif state == -1:
+            positions.loc[ref_index[i], 'SPY'] = -1.00
+        # state 2 = all cash (positions already 0)
 
     return positions
 
