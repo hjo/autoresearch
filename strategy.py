@@ -16,8 +16,10 @@ from prepare import (
 
 def generate_signals(data):
     """
-    SPY regime switch: equal-weight long when SPY uptrend, 100% cash when downtrend.
-    Uses dual SMA (50/200 hour) with hysteresis to minimize whipsaws.
+    Bi-directional SPY regime.
+    - Bullish (50-SMA > 200-SMA): equal-weight long all stocks
+    - Bearish (50-SMA < 200-SMA): short SPY with 30% allocation
+    - Hysteresis to prevent whipsaws
     """
     tickers = list(data.keys())
     stock_tickers = [t for t in tickers if t != 'SPY']
@@ -27,32 +29,30 @@ def generate_signals(data):
     ref_index = next(iter(data.values())).index
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
-    # SPY dual-SMA regime with hysteresis
     spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
     spy_fast = spy_close.rolling(50).mean()
     spy_slow = spy_close.rolling(200).mean()
 
-    # Regime: 1 = bullish, 0 = bearish
-    # Enter bullish when fast > slow * 1.005 (0.5% buffer)
-    # Exit bullish when fast < slow * 0.995
+    # Regime: 1 = bullish, -1 = bearish, 0 = warmup
     regime = pd.Series(0, index=ref_index, dtype=int)
     state = 0
     for i in range(len(regime)):
         f = spy_fast.iloc[i]
         s = spy_slow.iloc[i]
         if pd.isna(f) or pd.isna(s):
-            regime.iloc[i] = 0
             continue
-        if state == 0 and f > s * 1.005:
+        if state <= 0 and f > s * 1.005:
             state = 1
-        elif state == 1 and f < s * 0.995:
-            state = 0
+        elif state >= 0 and f < s * 0.995:
+            state = -1
         regime.iloc[i] = state
 
-    # In bullish regime: equal weight long all stocks
-    # In bearish regime: 100% cash
+    # Bullish: long individual stocks
     for ticker in stock_tickers:
-        positions[ticker] = regime * weight
+        positions[ticker] = (regime == 1).astype(float) * weight
+
+    # Bearish: short SPY with smaller allocation (hedge)
+    positions['SPY'] = (regime == -1).astype(float) * (-0.30)
 
     return positions
 
