@@ -80,7 +80,7 @@ def generate_signals(data):
             positions.loc[ref_index[i], 'SPY'] = -1.00
         elif state == 2:
             # Stopped out → go short SPY (smaller position than full bear)
-            positions.loc[ref_index[i], 'SPY'] = -0.50
+            positions.loc[ref_index[i], 'SPY'] = -1.00
 
     return positions
 
