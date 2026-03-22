@@ -1,7 +1,5 @@
 """
 Trading strategy — the file the agent modifies.
-Everything is fair game: indicators, signals, position sizing, risk management.
-
 Usage: uv run strategy.py
 """
 
@@ -16,66 +14,62 @@ from prepare import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Strategy: generate target positions for each ticker
-# ---------------------------------------------------------------------------
-
 def generate_signals(data):
     """
-    Generate target positions for each ticker.
-
-    Args:
-        data: dict mapping ticker -> DataFrame with OHLCV columns
-              (Open, High, Low, Close, Volume)
-
-    Returns:
-        DataFrame with tickers as columns, timestamps as index.
-        Values: target allocation fraction per ticker.
-        e.g., 1/N for equal-weight long, 0 for flat, negative for short.
+    SPY regime switch: equal-weight long when SPY uptrend, 100% cash when downtrend.
+    Uses dual SMA (50/200 hour) with hysteresis to minimize whipsaws.
     """
-    n_tickers = len(data)
-    weight = 1.0 / n_tickers  # equal weight per ticker
+    tickers = list(data.keys())
+    stock_tickers = [t for t in tickers if t != 'SPY']
+    n_stocks = len(stock_tickers)
+    weight = 1.0 / n_stocks
 
-    # Use first ticker's index as reference
     ref_index = next(iter(data.values())).index
-    positions = pd.DataFrame(0.0, index=ref_index, columns=list(data.keys()))
+    positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
-    for ticker, df in data.items():
-        close = df['Close']
+    # SPY dual-SMA regime with hysteresis
+    spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
+    spy_fast = spy_close.rolling(50).mean()
+    spy_slow = spy_close.rolling(200).mean()
 
-        # Simple moving average crossover
-        fast_sma = close.rolling(window=10).mean()
-        slow_sma = close.rolling(window=30).mean()
+    # Regime: 1 = bullish, 0 = bearish
+    # Enter bullish when fast > slow * 1.005 (0.5% buffer)
+    # Exit bullish when fast < slow * 0.995
+    regime = pd.Series(0, index=ref_index, dtype=int)
+    state = 0
+    for i in range(len(regime)):
+        f = spy_fast.iloc[i]
+        s = spy_slow.iloc[i]
+        if pd.isna(f) or pd.isna(s):
+            regime.iloc[i] = 0
+            continue
+        if state == 0 and f > s * 1.005:
+            state = 1
+        elif state == 1 and f < s * 0.995:
+            state = 0
+        regime.iloc[i] = state
 
-        # Go long when fast > slow, flat otherwise
-        signal = pd.Series(0.0, index=df.index)
-        signal[fast_sma > slow_sma] = weight
-
-        positions[ticker] = signal
+    # In bullish regime: equal weight long all stocks
+    # In bearish regime: 100% cash
+    for ticker in stock_tickers:
+        positions[ticker] = regime * weight
 
     return positions
 
 
-# ---------------------------------------------------------------------------
-# Main: run strategy and report results
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     start_time = time.time()
 
-    # --- Training set ---
     train_data = get_train_data()
     train_positions = generate_signals(train_data)
     train_results = backtest(train_positions, train_data)
 
-    # --- Validation set ---
     val_data = get_val_data()
     val_positions = generate_signals(val_data)
     val_results = backtest(val_positions, val_data)
 
     elapsed = time.time() - start_time
 
-    # --- Print summary (matches autoresearch output format) ---
     print("---")
     print(f"val_sharpe:       {val_results['sharpe']:.6f}")
     print(f"val_return:       {val_results['total_return']:.4f}")
