@@ -31,8 +31,8 @@ def generate_signals(data):
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
     spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
-    spy_fast = spy_close.rolling(45).mean()
-    spy_slow = spy_close.rolling(130).mean()
+    spy_fast = spy_close.rolling(43).mean()
+    spy_slow = spy_close.rolling(125).mean()
 
     # State machine: 0=warmup, 1=bull, -1=bear, 2=stopped_out (waiting for re-entry)
     state = 0
