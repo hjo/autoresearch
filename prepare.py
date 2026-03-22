@@ -3,7 +3,7 @@ Data preparation and backtesting infrastructure for autotrader.
 This file is READ-ONLY for the agent. Do not modify.
 
 Usage:
-    uv run prepare.py              # Download and cache data
+    uv run prepare.py              # Download and cache all data
     uv run prepare.py --refresh    # Force re-download
 
 Data is stored in ~/.cache/autotrader/.
@@ -23,38 +23,43 @@ import yfinance as yf
 # ---------------------------------------------------------------------------
 
 TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "SPY"]
-INTERVAL = "1h"
-PERIOD = "2y"
 INITIAL_CAPITAL = 100_000
 COMMISSION_BPS = 10          # 10 basis points per trade (0.1%)
 TRAIN_RATIO = 0.7            # 70% train, 30% validation
 TIME_BUDGET = 120            # max seconds for a single strategy run
 
+# Hourly data (2 years — yfinance limit)
+INTERVAL_HOURLY = "1h"
+PERIOD_HOURLY = "2y"
+
+# Daily data (10 years — for walk-forward analysis)
+INTERVAL_DAILY = "1d"
+PERIOD_DAILY = "10y"
+
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autotrader")
 
-# Annualization factor for Sharpe ratio (hourly bars)
-# ~6.5 trading hours/day, 252 trading days/year
-HOURS_PER_YEAR = 252 * 6.5
-ANNUAL_FACTOR = np.sqrt(HOURS_PER_YEAR)
+# Walk-forward defaults (in trading days)
+WF_TRAIN_DAYS = 756          # ~3 years
+WF_TEST_DAYS = 126           # ~6 months
+WF_STEP_DAYS = 126           # step forward 6 months
 
 # ---------------------------------------------------------------------------
 # Data download and caching
 # ---------------------------------------------------------------------------
 
-def download_data(refresh=False):
-    """Download historical data from yfinance and cache as parquet."""
+def _download(tickers, interval, period, suffix, refresh=False):
+    """Generic download helper. Saves as {ticker}_{suffix}.parquet."""
     os.makedirs(CACHE_DIR, exist_ok=True)
-
-    for ticker in TICKERS:
-        filepath = os.path.join(CACHE_DIR, f"{ticker}.parquet")
+    for ticker in tickers:
+        filepath = os.path.join(CACHE_DIR, f"{ticker}_{suffix}.parquet")
         if os.path.exists(filepath) and not refresh:
-            print(f"  {ticker}: cached")
+            print(f"  {ticker} ({suffix}): cached")
             continue
 
-        print(f"  {ticker}: downloading...")
+        print(f"  {ticker} ({suffix}): downloading...")
         try:
             data = yf.download(
-                ticker, period=PERIOD, interval=INTERVAL,
+                ticker, period=period, interval=interval,
                 progress=False, auto_adjust=True
             )
         except Exception as e:
@@ -65,29 +70,47 @@ def download_data(refresh=False):
             print(f"  WARNING: No data for {ticker}")
             continue
 
-        # Flatten multi-level columns if present
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
 
         data.to_parquet(filepath)
-        print(f"  {ticker}: {len(data)} bars saved")
+        print(f"  {ticker} ({suffix}): {len(data)} bars saved")
 
 
-def load_data():
-    """Load cached data for all tickers. Returns dict of ticker -> DataFrame."""
+def download_data(refresh=False):
+    """Download hourly data (2y) for quick iteration."""
+    _download(TICKERS, INTERVAL_HOURLY, PERIOD_HOURLY, "1h", refresh)
+
+
+def download_daily_data(refresh=False):
+    """Download daily data (10y) for walk-forward analysis."""
+    _download(TICKERS, INTERVAL_DAILY, PERIOD_DAILY, "1d", refresh)
+
+
+def _load(suffix):
+    """Load cached data for all tickers with given suffix."""
     data = {}
     for ticker in TICKERS:
-        filepath = os.path.join(CACHE_DIR, f"{ticker}.parquet")
+        filepath = os.path.join(CACHE_DIR, f"{ticker}_{suffix}.parquet")
         if not os.path.exists(filepath):
             raise FileNotFoundError(
-                f"No cached data for {ticker}. Run: uv run prepare.py"
+                f"No cached {suffix} data for {ticker}. Run: uv run prepare.py"
             )
         df = pd.read_parquet(filepath)
-        # Ensure clean column names
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         data[ticker] = df
     return data
+
+
+def load_data():
+    """Load cached hourly data. Returns dict of ticker -> DataFrame."""
+    return _load("1h")
+
+
+def load_daily_data():
+    """Load cached daily data (10y). Returns dict of ticker -> DataFrame."""
+    return _load("1d")
 
 
 def _split_data(data, split):
@@ -104,12 +127,12 @@ def _split_data(data, split):
 
 
 def get_train_data():
-    """Get training split of data (first 70%)."""
+    """Get training split of hourly data (first 70%)."""
     return _split_data(load_data(), "train")
 
 
 def get_val_data():
-    """Get validation split of data (last 30%)."""
+    """Get validation split of hourly data (last 30%)."""
     return _split_data(load_data(), "val")
 
 
@@ -123,13 +146,7 @@ def backtest(positions, data, initial_capital=INITIAL_CAPITAL):
 
     Args:
         positions: DataFrame with tickers as columns, timestamps as index.
-                   Values represent target allocation as fraction of portfolio:
-                   - 1.0 = fully long this ticker
-                   - 0.0 = flat (no position)
-                   - -1.0 = fully short
-                   Fractional values for partial positions.
-                   Sum of absolute allocations should ideally be <= 1.0.
-
+                   Values represent target allocation as fraction of portfolio.
         data: dict mapping ticker -> DataFrame with OHLCV columns
         initial_capital: starting capital
 
@@ -182,10 +199,10 @@ def backtest(positions, data, initial_capital=INITIAL_CAPITAL):
     drawdown = (equity - peak) / peak
     max_drawdown = drawdown.min()
 
-    # Number of trades (position changes > threshold)
+    # Number of trades
     num_trades = int((pos_changes.abs() > 0.001).sum().sum())
 
-    # Win rate on bars where we had a position
+    # Win rate
     positioned_mask = prev_pos.abs().sum(axis=1) > 0.001
     positioned_returns = portfolio_returns[positioned_mask]
     win_rate = float((positioned_returns > 0).mean()) if len(positioned_returns) > 0 else 0.0
@@ -223,14 +240,110 @@ def _empty_results():
 
 def evaluate_sharpe(positions, split="val"):
     """
-    Ground truth evaluation function.
-    Returns annualized Sharpe ratio on the specified data split.
-
-    This is the metric the agent optimizes. Higher is better.
+    Ground truth evaluation function for quick iteration.
+    Returns annualized Sharpe ratio on the specified hourly data split.
     """
     data = get_train_data() if split == "train" else get_val_data()
     results = backtest(positions, data)
     return results["sharpe"]
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward analysis
+# ---------------------------------------------------------------------------
+
+def walk_forward(signal_fn, train_days=WF_TRAIN_DAYS, test_days=WF_TEST_DAYS,
+                 step_days=WF_STEP_DAYS):
+    """
+    Walk-forward analysis on daily data.
+
+    Splits 10 years of daily data into rolling train/test windows:
+      [train_window] [test_window]
+                 [train_window] [test_window]
+                            ...
+
+    Args:
+        signal_fn: callable(data_dict) -> positions DataFrame
+                   The strategy's generate_signals function.
+        train_days: training window length in trading days
+        test_days:  test window length in trading days
+        step_days:  how far to step forward between windows
+
+    Returns:
+        dict with aggregate and per-window results
+    """
+    daily_data = load_daily_data()
+
+    # Find common date range across all tickers
+    all_dates = None
+    for ticker, df in daily_data.items():
+        dates = df.index
+        if all_dates is None:
+            all_dates = dates
+        else:
+            all_dates = all_dates.intersection(dates)
+    all_dates = all_dates.sort_values()
+    n_dates = len(all_dates)
+
+    windows = []
+    start = 0
+    while start + train_days + test_days <= n_dates:
+        train_end = start + train_days
+        test_end = train_end + test_days
+
+        # Slice data for this window
+        train_dates = all_dates[start:train_end]
+        test_dates = all_dates[train_end:test_end]
+
+        train_data = {}
+        test_data = {}
+        for ticker, df in daily_data.items():
+            train_data[ticker] = df.loc[df.index.isin(train_dates)].copy()
+            test_data[ticker] = df.loc[df.index.isin(test_dates)].copy()
+
+        # Generate signals on test data
+        # (strategy should be self-contained — it computes its own indicators)
+        try:
+            test_positions = signal_fn(test_data)
+            test_results = backtest(test_positions, test_data)
+        except Exception as e:
+            test_results = _empty_results()
+            test_results["error"] = str(e)
+
+        window_info = {
+            "train_start": str(train_dates[0].date()),
+            "train_end": str(train_dates[-1].date()),
+            "test_start": str(test_dates[0].date()),
+            "test_end": str(test_dates[-1].date()),
+            **{k: v for k, v in test_results.items() if k != "equity_curve"},
+        }
+        windows.append(window_info)
+
+        start += step_days
+
+    if not windows:
+        return {"error": "Not enough data for walk-forward analysis"}
+
+    # Aggregate statistics
+    sharpes = [w["sharpe"] for w in windows]
+    returns = [w["total_return"] for w in windows]
+    drawdowns = [w["max_drawdown"] for w in windows]
+    win_rates = [w["win_rate"] for w in windows]
+
+    return {
+        "n_windows": len(windows),
+        "avg_sharpe": float(np.mean(sharpes)),
+        "median_sharpe": float(np.median(sharpes)),
+        "std_sharpe": float(np.std(sharpes)),
+        "min_sharpe": float(np.min(sharpes)),
+        "max_sharpe": float(np.max(sharpes)),
+        "pct_positive_sharpe": float(np.mean([s > 0 for s in sharpes])),
+        "avg_return": float(np.mean(returns)),
+        "avg_max_drawdown": float(np.mean(drawdowns)),
+        "worst_drawdown": float(np.min(drawdowns)),
+        "avg_win_rate": float(np.mean(win_rates)),
+        "windows": windows,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -242,16 +355,18 @@ if __name__ == "__main__":
     parser.add_argument("--refresh", action="store_true", help="Force re-download")
     args = parser.parse_args()
 
-    print("Downloading data...")
+    print("Downloading hourly data (2y)...")
     download_data(refresh=args.refresh)
 
-    # Verify
-    print("\nData summary:")
+    print("\nDownloading daily data (10y)...")
+    download_daily_data(refresh=args.refresh)
+
+    # Verify hourly
+    print("\n--- Hourly Data ---")
     data = load_data()
     for ticker, df in data.items():
         print(f"  {ticker}: {len(df)} bars, {df.index[0]} to {df.index[-1]}")
 
-    # Show train/val split
     train = get_train_data()
     val = get_val_data()
     sample = TICKERS[0]
@@ -259,8 +374,20 @@ if __name__ == "__main__":
     print(f"\nTrain/Val split ({sample}):")
     print(f"  Train: {len(t)} bars ({t.index[0]} to {t.index[-1]})")
     print(f"  Val:   {len(v)} bars ({v.index[0]} to {v.index[-1]})")
+
+    # Verify daily
+    print("\n--- Daily Data (10y) ---")
+    daily = load_daily_data()
+    for ticker, df in daily.items():
+        print(f"  {ticker}: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}")
+
+    # Walk-forward window count
+    sample_n = len(daily[TICKERS[0]])
+    n_windows = (sample_n - WF_TRAIN_DAYS - WF_TEST_DAYS) // WF_STEP_DAYS + 1
+    print(f"\nWalk-forward: {n_windows} windows "
+          f"(train={WF_TRAIN_DAYS}d, test={WF_TEST_DAYS}d, step={WF_STEP_DAYS}d)")
+
     print(f"\nTickers: {', '.join(TICKERS)}")
-    print(f"Interval: {INTERVAL}")
     print(f"Initial capital: ${INITIAL_CAPITAL:,.0f}")
     print(f"Commission: {COMMISSION_BPS} bps")
     print("\nData ready!")
