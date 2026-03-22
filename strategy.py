@@ -23,7 +23,7 @@ TRAILING_STOP = 0.05    # 5% from peak
 HYSTERESIS_UP = 1.015   # 1.5% buffer to enter bull
 HYSTERESIS_DN = 0.985   # 1.5% buffer to enter bear
 REENTRY_BAR = 1.02      # 2% buffer to re-enter after stop
-SHORT_ALLOC = 0.50      # 50% short SPY in bear
+SHORT_ALLOC = 0.30      # 30% short SPY in bear
 
 
 def _bars_per_day(data):
