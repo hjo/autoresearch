@@ -52,7 +52,7 @@ def generate_signals(data):
         positions[ticker] = (regime == 1).astype(float) * weight
 
     # Bearish: short SPY with smaller allocation (hedge)
-    positions['SPY'] = (regime == -1).astype(float) * (-0.90)
+    positions['SPY'] = (regime == -1).astype(float) * (-1.00)
 
     return positions
 
