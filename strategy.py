@@ -22,7 +22,7 @@ TRAILING_STOP = 0.05
 HYSTERESIS_UP = 1.015
 HYSTERESIS_DN = 0.985
 REENTRY_BAR = 1.02
-TOP_N = 4  # Hold top N stocks by momentum
+TOP_N = 3  # Hold top N stocks by momentum
 
 
 def _bars_per_day(data):
