@@ -1,389 +1,412 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Data preparation and backtesting infrastructure for autotrader.
+This file is READ-ONLY for the agent. Do not modify.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    uv run prepare.py              # Download and cache all data
+    uv run prepare.py --refresh    # Force re-download
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data is stored in ~/.cache/autotrader/.
 """
 
 import os
 import sys
 import time
-import math
 import argparse
-import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
-import torch
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+# Diversified universe: stocks + bonds + gold for all-weather allocation
+TICKERS = [
+    # Tech
+    "AAPL", "MSFT", "GOOGL", "NVDA",
+    # Healthcare
+    "UNH", "JNJ",
+    # Financials
+    "JPM", "V",
+    # Energy
+    "XOM",
+    # Consumer
+    "PG", "COST",
+    # Industrial
+    "CAT",
+    # Safe havens (for bear regime rotation)
+    "TLT",   # 20+ year Treasury bonds
+    "GLD",   # Gold
+    # Market index
+    "SPY",
+]
+INITIAL_CAPITAL = 100_000
+COMMISSION_BPS = 10          # 10 basis points per trade (0.1%)
+TRAIN_RATIO = 0.7            # 70% train, 30% validation
+TIME_BUDGET = 120            # max seconds for a single strategy run
+
+# Hourly data (2 years — yfinance limit)
+INTERVAL_HOURLY = "1h"
+PERIOD_HOURLY = "2y"
+
+# Daily data (10 years — for walk-forward analysis)
+INTERVAL_DAILY = "1d"
+PERIOD_DAILY = "10y"
+
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autotrader")
+
+# Walk-forward defaults (in trading days)
+WF_TRAIN_DAYS = 756          # ~3 years
+WF_TEST_DAYS = 126           # ~6 months
+WF_STEP_DAYS = 126           # step forward 6 months
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Data download and caching
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+def _download(tickers, interval, period, suffix, refresh=False):
+    """Generic download helper. Saves as {ticker}_{suffix}.parquet."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    for ticker in tickers:
+        filepath = os.path.join(CACHE_DIR, f"{ticker}_{suffix}.parquet")
+        if os.path.exists(filepath) and not refresh:
+            print(f"  {ticker} ({suffix}): cached")
+            continue
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
-
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
-
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
-
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
+        print(f"  {ticker} ({suffix}): downloading...")
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+            data = yf.download(
+                ticker, period=period, interval=interval,
+                progress=False, auto_adjust=True
+            )
+        except Exception as e:
+            print(f"  WARNING: Failed to download {ticker}: {e}")
+            continue
+
+        if data.empty:
+            print(f"  WARNING: No data for {ticker}")
+            continue
+
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+
+        data.to_parquet(filepath)
+        print(f"  {ticker} ({suffix}): {len(data)} bars saved")
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def download_data(refresh=False):
+    """Download hourly data (2y) for quick iteration."""
+    _download(TICKERS, INTERVAL_HOURLY, PERIOD_HOURLY, "1h", refresh)
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def download_daily_data(refresh=False):
+    """Download daily data (10y) for walk-forward analysis."""
+    _download(TICKERS, INTERVAL_DAILY, PERIOD_DAILY, "1d", refresh)
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def _load(suffix):
+    """Load cached data for all tickers with given suffix."""
+    data = {}
+    for ticker in TICKERS:
+        filepath = os.path.join(CACHE_DIR, f"{ticker}_{suffix}.parquet")
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(
+                f"No cached {suffix} data for {ticker}. Run: uv run prepare.py"
+            )
+        df = pd.read_parquet(filepath)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        data[ticker] = df
+    return data
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+def load_data():
+    """Load cached hourly data. Returns dict of ticker -> DataFrame."""
+    return _load("1h")
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+def load_daily_data():
+    """Load cached daily data (10y). Returns dict of ticker -> DataFrame."""
+    return _load("1d")
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
-
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
-
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
-
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+def _split_data(data, split):
+    """Split data dict into train or val portion."""
+    result = {}
+    for ticker, df in data.items():
+        n = len(df)
+        split_idx = int(n * TRAIN_RATIO)
+        if split == "train":
+            result[ticker] = df.iloc[:split_idx].copy()
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            result[ticker] = df.iloc[split_idx:].copy()
+    return result
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+
+def get_train_data():
+    """Get training split of hourly data (first 70%)."""
+    return _split_data(load_data(), "train")
+
+
+def get_val_data():
+    """Get validation split of hourly data (last 30%)."""
+    return _split_data(load_data(), "val")
+
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# Backtesting engine
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+def backtest(positions, data, initial_capital=INITIAL_CAPITAL):
+    """
+    Vectorized backtest engine.
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    Args:
+        positions: DataFrame with tickers as columns, timestamps as index.
+                   Values represent target allocation as fraction of portfolio.
+        data: dict mapping ticker -> DataFrame with OHLCV columns
+        initial_capital: starting capital
 
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    Returns:
+        dict with performance metrics
+    """
+    # Build aligned close price matrix
+    prices = pd.DataFrame({
+        ticker: df['Close'] for ticker, df in data.items()
+    })
 
-    def get_vocab_size(self):
-        return self.enc.n_vocab
+    # Align on common timestamps
+    common_idx = positions.index.intersection(prices.index)
+    if len(common_idx) < 2:
+        return _empty_results()
 
-    def get_bos_token_id(self):
-        return self.bos_token_id
+    positions = positions.loc[common_idx].fillna(0)
+    prices = prices.loc[common_idx]
 
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
+    # Bar-level returns
+    returns = prices.pct_change(fill_method=None).fillna(0)
 
-    def decode(self, ids):
-        return self.enc.decode(ids)
+    # Commission on position changes
+    pos_changes = positions.diff().fillna(positions.iloc[0:1])
+    commission = pos_changes.abs().sum(axis=1) * (COMMISSION_BPS / 10_000)
 
+    # Portfolio return per bar: sum of (prev_position * return) - commission
+    prev_pos = positions.shift(1).fillna(0)
+    portfolio_returns = (prev_pos * returns).sum(axis=1) - commission
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+    # Equity curve
+    equity = initial_capital * (1 + portfolio_returns).cumprod()
 
+    # --- Metrics ---
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
+    # Total return
+    total_return = (equity.iloc[-1] / initial_capital) - 1
+
+    # Annualized Sharpe ratio (computed on daily aggregated returns for stability)
+    if hasattr(portfolio_returns.index, 'date'):
+        daily_returns = portfolio_returns.groupby(portfolio_returns.index.date).sum()
     else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        daily_returns = portfolio_returns
+    daily_mean = daily_returns.mean()
+    daily_std = daily_returns.std()
+    sharpe = (daily_mean / daily_std * np.sqrt(252)) if daily_std > 0 else 0.0
+
+    # Max drawdown
+    peak = equity.cummax()
+    drawdown = (equity - peak) / peak
+    max_drawdown = drawdown.min()
+
+    # Number of trades
+    num_trades = int((pos_changes.abs() > 0.001).sum().sum())
+
+    # Win rate
+    positioned_mask = prev_pos.abs().sum(axis=1) > 0.001
+    positioned_returns = portfolio_returns[positioned_mask]
+    win_rate = float((positioned_returns > 0).mean()) if len(positioned_returns) > 0 else 0.0
+
+    # Profit factor
+    gross_profit = positioned_returns[positioned_returns > 0].sum()
+    gross_loss = abs(positioned_returns[positioned_returns < 0].sum())
+    profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+
+    return {
+        "sharpe": float(sharpe),
+        "total_return": float(total_return),
+        "max_drawdown": float(max_drawdown),
+        "win_rate": float(win_rate),
+        "num_trades": num_trades,
+        "profit_factor": float(min(profit_factor, 999.9)),
+        "final_equity": float(equity.iloc[-1]),
+        "equity_curve": equity,
+    }
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def _empty_results():
+    """Return zeroed-out results for failed/empty backtests."""
+    return {
+        "sharpe": 0.0,
+        "total_return": 0.0,
+        "max_drawdown": 0.0,
+        "win_rate": 0.0,
+        "num_trades": 0,
+        "profit_factor": 0.0,
+        "final_equity": 0.0,
+        "equity_curve": pd.Series(dtype=float),
+    }
+
+
+def evaluate_sharpe(positions, split="val"):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    Ground truth evaluation function for quick iteration.
+    Returns annualized Sharpe ratio on the specified hourly data split.
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    data = get_train_data() if split == "train" else get_val_data()
+    results = backtest(positions, data)
+    return results["sharpe"]
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Walk-forward analysis
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def walk_forward(signal_fn, train_days=WF_TRAIN_DAYS, test_days=WF_TEST_DAYS,
+                 step_days=WF_STEP_DAYS):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    Walk-forward analysis on daily data.
+
+    Splits 10 years of daily data into rolling train/test windows:
+      [train_window] [test_window]
+                 [train_window] [test_window]
+                            ...
+
+    Args:
+        signal_fn: callable(data_dict) -> positions DataFrame
+                   The strategy's generate_signals function.
+        train_days: training window length in trading days
+        test_days:  test window length in trading days
+        step_days:  how far to step forward between windows
+
+    Returns:
+        dict with aggregate and per-window results
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    daily_data = load_daily_data()
+
+    # Find common date range across all tickers
+    all_dates = None
+    for ticker, df in daily_data.items():
+        dates = df.index
+        if all_dates is None:
+            all_dates = dates
+        else:
+            all_dates = all_dates.intersection(dates)
+    all_dates = all_dates.sort_values()
+    n_dates = len(all_dates)
+
+    windows = []
+    start = 0
+    while start + train_days + test_days <= n_dates:
+        train_end = start + train_days
+        test_end = train_end + test_days
+
+        # Slice data for this window
+        train_dates = all_dates[start:train_end]
+        test_dates = all_dates[train_end:test_end]
+
+        train_data = {}
+        test_data = {}
+        for ticker, df in daily_data.items():
+            train_data[ticker] = df.loc[df.index.isin(train_dates)].copy()
+            test_data[ticker] = df.loc[df.index.isin(test_dates)].copy()
+
+        # Generate signals on test data
+        # (strategy should be self-contained — it computes its own indicators)
+        try:
+            test_positions = signal_fn(test_data)
+            test_results = backtest(test_positions, test_data)
+        except Exception as e:
+            test_results = _empty_results()
+            test_results["error"] = str(e)
+
+        window_info = {
+            "train_start": str(train_dates[0].date()),
+            "train_end": str(train_dates[-1].date()),
+            "test_start": str(test_dates[0].date()),
+            "test_end": str(test_dates[-1].date()),
+            **{k: v for k, v in test_results.items() if k != "equity_curve"},
+        }
+        windows.append(window_info)
+
+        start += step_days
+
+    if not windows:
+        return {"error": "Not enough data for walk-forward analysis"}
+
+    # Aggregate statistics
+    sharpes = [w["sharpe"] for w in windows]
+    returns = [w["total_return"] for w in windows]
+    drawdowns = [w["max_drawdown"] for w in windows]
+    win_rates = [w["win_rate"] for w in windows]
+
+    return {
+        "n_windows": len(windows),
+        "avg_sharpe": float(np.mean(sharpes)),
+        "median_sharpe": float(np.median(sharpes)),
+        "std_sharpe": float(np.std(sharpes)),
+        "min_sharpe": float(np.min(sharpes)),
+        "max_sharpe": float(np.max(sharpes)),
+        "pct_positive_sharpe": float(np.mean([s > 0 for s in sharpes])),
+        "avg_return": float(np.mean(returns)),
+        "avg_max_drawdown": float(np.mean(drawdowns)),
+        "worst_drawdown": float(np.min(drawdowns)),
+        "avg_win_rate": float(np.mean(win_rates)),
+        "windows": windows,
+    }
+
 
 # ---------------------------------------------------------------------------
-# Main
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="Download and prepare trading data")
+    parser.add_argument("--refresh", action="store_true", help="Force re-download")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    print("Downloading hourly data (2y)...")
+    download_data(refresh=args.refresh)
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+    print("\nDownloading daily data (10y)...")
+    download_daily_data(refresh=args.refresh)
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    # Verify hourly
+    print("\n--- Hourly Data ---")
+    data = load_data()
+    for ticker, df in data.items():
+        print(f"  {ticker}: {len(df)} bars, {df.index[0]} to {df.index[-1]}")
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    train = get_train_data()
+    val = get_val_data()
+    sample = TICKERS[0]
+    t, v = train[sample], val[sample]
+    print(f"\nTrain/Val split ({sample}):")
+    print(f"  Train: {len(t)} bars ({t.index[0]} to {t.index[-1]})")
+    print(f"  Val:   {len(v)} bars ({v.index[0]} to {v.index[-1]})")
+
+    # Verify daily
+    print("\n--- Daily Data (10y) ---")
+    daily = load_daily_data()
+    for ticker, df in daily.items():
+        print(f"  {ticker}: {len(df)} bars, {df.index[0].date()} to {df.index[-1].date()}")
+
+    # Walk-forward window count
+    sample_n = len(daily[TICKERS[0]])
+    n_windows = (sample_n - WF_TRAIN_DAYS - WF_TEST_DAYS) // WF_STEP_DAYS + 1
+    print(f"\nWalk-forward: {n_windows} windows "
+          f"(train={WF_TRAIN_DAYS}d, test={WF_TEST_DAYS}d, step={WF_STEP_DAYS}d)")
+
+    print(f"\nTickers: {', '.join(TICKERS)}")
+    print(f"Initial capital: ${INITIAL_CAPITAL:,.0f}")
+    print(f"Commission: {COMMISSION_BPS} bps")
+    print("\nData ready!")
