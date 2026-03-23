@@ -167,8 +167,9 @@ def strategy_mean_reversion(data, alloc=0.25):
     max_positions = 3  # max 3 simultaneous mean reversion trades
     per_stock_weight = alloc / max_positions
 
-    # Per-stock Bollinger Bands and state
-    stock_states = {t: 0 for t in stock_tickers}  # 0=flat, 1=long (waiting for reversion)
+    # Per-stock state: 0=flat, positive=bars held since entry
+    stock_bars_held = {t: 0 for t in stock_tickers}
+    max_hold = max(5, int(15 * bpd))  # time stop: max 15 days in a trade
 
     for t in stock_tickers:
         close = data[t]['Close'].reindex(ref_index, method='ffill')
@@ -184,19 +185,19 @@ def strategy_mean_reversion(data, alloc=0.25):
             if pd.isna(lower) or pd.isna(mid):
                 continue
 
-            if stock_states[t] == 0:
+            if stock_bars_held[t] == 0:
                 # Entry: price touches lower band
                 if price_val <= lower:
-                    # Check how many positions are open
-                    active = sum(1 for s in stock_states.values() if s == 1)
+                    active = sum(1 for v in stock_bars_held.values() if v > 0)
                     if active < max_positions:
-                        stock_states[t] = 1
-            elif stock_states[t] == 1:
-                # Exit: price reverts above middle band
-                if price_val >= mid:
-                    stock_states[t] = 0
+                        stock_bars_held[t] = 1
+            elif stock_bars_held[t] > 0:
+                stock_bars_held[t] += 1
+                # Exit: price reverts above middle band OR time stop
+                if price_val >= mid or stock_bars_held[t] > max_hold:
+                    stock_bars_held[t] = 0
 
-            if stock_states[t] == 1:
+            if stock_bars_held[t] > 0:
                 positions.loc[ref_index[i], t] = per_stock_weight
 
     return positions
