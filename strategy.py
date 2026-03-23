@@ -5,7 +5,10 @@ Usage:
     uv run strategy.py --walk-forward   # Robust: walk-forward on 10y daily data
 """
 
+import json
+import os
 import time
+
 import numpy as np
 import pandas as pd
 import ta
@@ -14,6 +17,41 @@ from prepare import (
     TICKERS, TIME_BUDGET, INITIAL_CAPITAL,
     get_train_data, get_val_data, backtest, walk_forward,
 )
+
+
+# ---------------------------------------------------------------------------
+# Earnings calendar
+# ---------------------------------------------------------------------------
+
+_EARNINGS_CACHE = None
+
+def _load_earnings_dates():
+    """Load cached earnings dates. Returns dict of ticker -> set of dates."""
+    global _EARNINGS_CACHE
+    if _EARNINGS_CACHE is not None:
+        return _EARNINGS_CACHE
+    cache_path = os.path.join(
+        os.path.expanduser("~"), ".cache", "autotrader", "earnings_dates.json"
+    )
+    if not os.path.exists(cache_path):
+        _EARNINGS_CACHE = {}
+        return _EARNINGS_CACHE
+    with open(cache_path) as f:
+        raw = json.load(f)
+    _EARNINGS_CACHE = {
+        t: {pd.Timestamp(d) for d in dates} for t, dates in raw.items()
+    }
+    return _EARNINGS_CACHE
+
+
+def _near_earnings(ticker, date, days_before=2, days_after=1):
+    """Check if date is within N days of an earnings announcement."""
+    earnings = _load_earnings_dates().get(ticker, set())
+    for ed in earnings:
+        diff = (ed - date).days
+        if -days_after <= diff <= days_before:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

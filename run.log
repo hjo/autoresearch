@@ -1,0 +1,11 @@
+---
+val_sharpe:       -0.130851
+val_return:       -0.0199
+val_max_drawdown: -0.1792
+val_win_rate:     0.4950
+val_num_trades:   135
+val_profit_factor:0.99
+val_final_equity: 98009.58
+train_sharpe:     0.588397
+train_return:     0.1585
+total_seconds:    0.4
