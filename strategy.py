@@ -25,8 +25,8 @@ REENTRY_BAR = 1.02
 TOP_N = 3
 
 # Safe havens to rotate into during bear regime
-SAFE_HAVENS = ["TLT", "GLD"]
-SAFE_HAVEN_ALLOC = 0.50  # 50% into safe havens during bear (rest cash)
+SAFE_HAVENS = ["GLD"]
+SAFE_HAVEN_ALLOC = 0.50  # 50% into gold during bear (rest cash)
 
 
 def _bars_per_day(data):
