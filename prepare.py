@@ -22,7 +22,23 @@ import yfinance as yf
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "SPY"]
+# Diversified universe: tech + healthcare + financials + energy + consumer + industrial + bonds
+TICKERS = [
+    # Tech
+    "AAPL", "MSFT", "GOOGL", "NVDA",
+    # Healthcare
+    "UNH", "JNJ",
+    # Financials
+    "JPM", "V",
+    # Energy
+    "XOM",
+    # Consumer
+    "PG", "COST",
+    # Industrial
+    "CAT",
+    # Market index
+    "SPY",
+]
 INITIAL_CAPITAL = 100_000
 COMMISSION_BPS = 10          # 10 basis points per trade (0.1%)
 TRAIN_RATIO = 0.7            # 70% train, 30% validation
