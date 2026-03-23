@@ -41,6 +41,8 @@ TICKERS = [
     "GLD",   # Gold
     # Market index
     "SPY",
+    # Volatility indicator (not traded, used for regime detection)
+    "^VIX",
 ]
 INITIAL_CAPITAL = 100_000
 COMMISSION_BPS = 10          # 10 basis points per trade (0.1%)

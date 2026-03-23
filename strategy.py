@@ -46,7 +46,7 @@ def _get_tickers(data, exclude=()):
 def strategy_trend(data, alloc=0.40):
     """SPY regime + top-3 momentum + adaptive trailing stop + conditional gold."""
     tickers = list(data.keys())
-    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT', '^VIX'))
     ref_index = _get_ref_index(data)
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
@@ -175,7 +175,7 @@ def strategy_mean_reversion(data, alloc=0.25):
     Uses state tracking per stock to avoid continuous rebalancing.
     """
     tickers = list(data.keys())
-    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT', '^VIX'))
     ref_index = _get_ref_index(data)
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
@@ -235,7 +235,7 @@ def strategy_relative_value(data, alloc=0.20):
     Market-neutral (equal long/short). Rebalance every 5 days.
     """
     tickers = list(data.keys())
-    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT', '^VIX'))
     ref_index = _get_ref_index(data)
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
