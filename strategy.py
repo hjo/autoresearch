@@ -296,14 +296,12 @@ def generate_signals(data):
     Multi-strategy portfolio combining 4 uncorrelated strategies.
     Total allocation: 40% + 25% + 20% + 15% = 100%
     """
-    # Run each strategy independently
-    pos_trend = strategy_trend(data, alloc=0.40)
-    pos_mr = strategy_mean_reversion(data, alloc=0.25)
-    pos_rv = strategy_relative_value(data, alloc=0.20)
-    pos_gold = strategy_gold_momentum(data, alloc=0.15)
+    # Run the two winning strategies
+    pos_trend = strategy_trend(data, alloc=0.60)
+    pos_mr = strategy_mean_reversion(data, alloc=0.40)
 
-    # Sum positions (each strategy uses its own allocation slice)
-    positions = pos_trend.add(pos_mr, fill_value=0).add(pos_rv, fill_value=0).add(pos_gold, fill_value=0)
+    # Sum positions
+    positions = pos_trend.add(pos_mr, fill_value=0)
 
     return positions
 
