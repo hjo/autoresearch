@@ -16,57 +16,57 @@ from prepare import (
 )
 
 
-# Strategy parameters in TRADING DAYS (frequency-independent)
-FAST_SMA_DAYS = 7       # ~1.5 weeks
-SLOW_SMA_DAYS = 19      # ~1 month
-TRAILING_STOP = 0.05    # 5% from peak
-HYSTERESIS_UP = 1.015   # 1.5% buffer to enter bull
-HYSTERESIS_DN = 0.985   # 1.5% buffer to enter bear
-REENTRY_BAR = 1.02      # 2% buffer to re-enter after stop
-SHORT_ALLOC = 0.00      # No short — just go to cash in bear
+FAST_SMA_DAYS = 7
+SLOW_SMA_DAYS = 19
+TRAILING_STOP = 0.05
+HYSTERESIS_UP = 1.015
+HYSTERESIS_DN = 0.985
+REENTRY_BAR = 1.02
+TOP_N = 4  # Hold top N stocks by momentum
 
 
 def _bars_per_day(data):
-    """Detect bars per trading day from data frequency."""
     idx = next(iter(data.values())).index
     if len(idx) < 10:
         return 1
-    # Count bars per calendar date
     if hasattr(idx, 'date'):
         bars_per_date = pd.Series(idx).groupby(idx.date).count()
-        median_bpd = bars_per_date.median()
-        return max(1, int(round(median_bpd)))
-    return 1  # daily data
+        return max(1, int(round(bars_per_date.median())))
+    return 1
 
 
 def generate_signals(data):
     """
-    SPY regime switch + trailing stop.
-    Frequency-adaptive: works on both hourly and daily data.
-    - Bull (fast SMA > slow SMA): equal-weight long all stocks
-    - Bear (fast SMA < slow SMA): short SPY
-    - 3% trailing stop in bull → flip to short
+    SPY regime + concentrated momentum.
+    - Bull: hold TOP_N stocks by momentum, selected at regime entry, held throughout
+    - Bear/stopped: cash
+    - 5% trailing stop
     """
     tickers = list(data.keys())
     stock_tickers = [t for t in tickers if t != 'SPY']
     n_stocks = len(stock_tickers)
-    weight = 1.0 / n_stocks
 
     ref_index = next(iter(data.values())).index
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
-    # Convert day-based parameters to bar counts
     bpd = _bars_per_day(data)
     fast_bars = max(2, int(FAST_SMA_DAYS * bpd))
     slow_bars = max(5, int(SLOW_SMA_DAYS * bpd))
+    mom_bars = max(5, int(15 * bpd))
 
     spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
     spy_fast = spy_close.rolling(fast_bars).mean()
     spy_slow = spy_close.rolling(slow_bars).mean()
 
-    # State machine: 0=warmup, 1=bull, -1=bear, 2=stopped_out
+    close_matrix = pd.DataFrame(
+        {t: data[t]['Close'].reindex(ref_index, method='ffill') for t in stock_tickers}
+    )
+    momentum = close_matrix.pct_change(mom_bars)
+
     state = 0
     spy_peak = 0.0
+    selected = []  # stocks selected at bull entry
+    weight = 0.0
 
     for i in range(len(ref_index)):
         f = spy_fast.iloc[i]
@@ -76,7 +76,9 @@ def generate_signals(data):
         if pd.isna(f) or pd.isna(s):
             continue
 
-        if state == 1:  # In bull
+        prev_state = state
+
+        if state == 1:
             spy_peak = max(spy_peak, price)
             if price < spy_peak * (1 - TRAILING_STOP):
                 state = 2
@@ -84,17 +86,17 @@ def generate_signals(data):
             elif f < s * HYSTERESIS_DN:
                 state = -1
                 spy_peak = 0.0
-        elif state == -1:  # In bear
+        elif state == -1:
             if f > s * HYSTERESIS_UP:
                 state = 1
                 spy_peak = price
-        elif state == 2:  # Stopped out
+        elif state == 2:
             if f > s * REENTRY_BAR:
                 state = 1
                 spy_peak = price
             elif f < s * HYSTERESIS_DN:
                 state = -1
-        elif state == 0:  # Warmup
+        elif state == 0:
             if f > s * HYSTERESIS_UP:
                 state = 1
                 spy_peak = price
@@ -102,10 +104,20 @@ def generate_signals(data):
                 state = -1
 
         if state == 1:
-            for t in stock_tickers:
+            # Select stocks on entry to bull regime
+            if prev_state != 1:
+                mom = momentum.iloc[i]
+                valid = mom.dropna()
+                if len(valid) >= TOP_N:
+                    selected = valid.nlargest(TOP_N).index.tolist()
+                else:
+                    selected = stock_tickers[:TOP_N]
+                weight = 1.0 / len(selected)
+
+            for t in selected:
                 positions.loc[ref_index[i], t] = weight
-        elif state in (-1, 2):
-            positions.loc[ref_index[i], 'SPY'] = -SHORT_ALLOC
+        else:
+            selected = []
 
     return positions
 
@@ -141,7 +153,6 @@ if __name__ == "__main__":
             print(f"{period:<26} {w['sharpe']:>8.3f} {w['total_return']:>8.3%} "
                   f"{w['max_drawdown']:>8.3%} {w['num_trades']:>7}")
     else:
-        # Quick iteration: train/val on hourly data
         train_data = get_train_data()
         train_positions = generate_signals(train_data)
         train_results = backtest(train_positions, train_data)
