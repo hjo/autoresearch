@@ -88,7 +88,7 @@ def strategy_trend(data, alloc=0.40):
         if state == 1:
             spy_peak = max(spy_peak, price)
             gain = (spy_peak / spy_entry - 1) if spy_entry > 0 else 0
-            stop_pct = 0.03 if gain > 0.05 else 0.05
+            stop_pct = 0.03 if gain > 0.03 else 0.05
             if price < spy_peak * (1 - stop_pct):
                 state = 2
                 spy_peak = 0.0
@@ -298,8 +298,8 @@ def generate_signals(data):
     Total allocation: 40% + 25% + 20% + 15% = 100%
     """
     # Run the two winning strategies
-    pos_trend = strategy_trend(data, alloc=0.60)
-    pos_mr = strategy_mean_reversion(data, alloc=0.40)
+    pos_trend = strategy_trend(data, alloc=0.55)
+    pos_mr = strategy_mean_reversion(data, alloc=0.45)
 
     # Sum positions
     positions = pos_trend.add(pos_mr, fill_value=0)
