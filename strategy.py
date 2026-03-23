@@ -326,15 +326,12 @@ if __name__ == "__main__":
         # Also run individual strategies for comparison
         wf_trend = walk_forward(lambda d: strategy_trend(d, 1.0))
         wf_mr = walk_forward(lambda d: strategy_mean_reversion(d, 1.0))
-        wf_rv = walk_forward(lambda d: strategy_relative_value(d, 1.0))
-        wf_gold = walk_forward(lambda d: strategy_gold_momentum(d, 1.0))
 
         elapsed = time.time() - start_time
 
         print(f"{'Strategy':<20} {'Avg Sharpe':>10} {'Median':>8} {'%Pos':>6} {'AvgRet':>8}")
         print("-" * 55)
         for name, w in [("TREND", wf_trend), ("MEAN REVERT", wf_mr),
-                         ("REL VALUE", wf_rv), ("GOLD MOM", wf_gold),
                          ("** COMBINED **", wf)]:
             print(f"{name:<20} {w['avg_sharpe']:>10.4f} {w['median_sharpe']:>8.4f} "
                   f"{w['pct_positive_sharpe']:>5.0%} {w['avg_return']:>8.4f}")
