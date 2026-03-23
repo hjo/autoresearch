@@ -59,8 +59,14 @@ def generate_signals(data):
     mom_bars = max(5, int(15 * bpd))
 
     spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
+    spy_high = data['SPY']['High'].reindex(ref_index, method='ffill') if 'High' in data['SPY'].columns else spy_close
+    spy_low = data['SPY']['Low'].reindex(ref_index, method='ffill') if 'Low' in data['SPY'].columns else spy_close
     spy_fast = spy_close.rolling(fast_bars).mean()
     spy_slow = spy_close.rolling(slow_bars).mean()
+
+    # RSI for exposure scaling
+    rsi_period = max(5, int(14 * bpd))
+    spy_rsi = ta.momentum.RSIIndicator(spy_close, window=min(rsi_period, 14)).rsi()
 
     close_matrix = pd.DataFrame(
         {t: data[t]['Close'].reindex(ref_index, method='ffill') for t in stock_tickers}
@@ -76,6 +82,7 @@ def generate_signals(data):
     spy_entry = 0.0
     selected = []
     weight = 0.0
+    exposure_mult = 1.0  # RSI-based exposure multiplier
 
     for i in range(len(ref_index)):
         f = spy_fast.iloc[i]
@@ -127,9 +134,19 @@ def generate_signals(data):
                 else:
                     selected = stock_tickers[:TOP_N]
                 weight = 1.0 / len(selected)
+                exposure_mult = 1.0  # reset on entry
+
+            # RSI exposure scaling (discrete jumps at extremes)
+            rsi_val = spy_rsi.iloc[i] if not pd.isna(spy_rsi.iloc[i]) else 50
+            if rsi_val < 30:
+                exposure_mult = 1.3   # buy the dip
+            elif rsi_val > 70:
+                exposure_mult = 0.5   # take profit
+            elif 40 < rsi_val < 60:
+                exposure_mult = 1.0   # normal
 
             for t in selected:
-                positions.loc[ref_index[i], t] = weight
+                positions.loc[ref_index[i], t] = weight * exposure_mult
 
         elif state in (-1, 2):
             # Bear/stopped: rotate into gold ONLY if gold is trending up
