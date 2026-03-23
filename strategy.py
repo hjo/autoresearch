@@ -68,12 +68,18 @@ def strategy_trend(data, alloc=0.40):
     gld_close = data['GLD']['Close'].reindex(ref_index, method='ffill') if 'GLD' in data else None
     gld_sma = gld_close.rolling(slow_bars).mean() if gld_close is not None else None
 
+    tlt_close = data['TLT']['Close'].reindex(ref_index, method='ffill') if 'TLT' in data else None
+    tlt_sma = tlt_close.rolling(slow_bars).mean() if tlt_close is not None else None
+
+
     state = 0
     spy_peak = 0.0
     spy_entry = 0.0
     selected = []
     weight = 0.0
     exposure_mult = 1.0
+    cooldown = 0  # bars remaining before re-entry allowed after trailing stop
+    COOLDOWN_BARS = max(3, int(10 * bpd))
     TOP_N = 3
 
     for i in range(len(ref_index)):
@@ -85,6 +91,9 @@ def strategy_trend(data, alloc=0.40):
 
         prev_state = state
 
+        if cooldown > 0:
+            cooldown -= 1
+
         if state == 1:
             spy_peak = max(spy_peak, price)
             gain = (spy_peak / spy_entry - 1) if spy_entry > 0 else 0
@@ -92,6 +101,7 @@ def strategy_trend(data, alloc=0.40):
             if price < spy_peak * (1 - stop_pct):
                 state = 2
                 spy_peak = 0.0
+                cooldown = COOLDOWN_BARS  # start cooldown after trailing stop
             elif f < s * 0.985:
                 state = -1
                 spy_peak = 0.0
@@ -101,7 +111,7 @@ def strategy_trend(data, alloc=0.40):
                 spy_peak = price
                 spy_entry = price
         elif state == 2:
-            if f > s * 1.02:
+            if cooldown == 0 and f > s * 1.02:
                 state = 1
                 spy_peak = price
                 spy_entry = price
@@ -141,6 +151,13 @@ def strategy_trend(data, alloc=0.40):
                 gs = gld_sma.iloc[i]
                 if not pd.isna(gs) and g > gs:
                     positions.loc[ref_index[i], 'GLD'] = alloc * 0.5
+
+            # TLT defensive rotation: allocate to treasuries during bear when TLT trending up
+            if tlt_close is not None and tlt_sma is not None:
+                t_price = tlt_close.iloc[i]
+                t_sma = tlt_sma.iloc[i]
+                if not pd.isna(t_sma) and t_price > t_sma:
+                    positions.loc[ref_index[i], 'TLT'] = alloc * 0.3
 
     return positions
 
@@ -296,15 +313,48 @@ def strategy_gold_momentum(data, alloc=0.15):
 
 def generate_signals(data):
     """
-    Multi-strategy portfolio combining 4 uncorrelated strategies.
-    Total allocation: 40% + 25% + 20% + 15% = 100%
+    Multi-strategy portfolio: dynamic vol-regime allocation + vol targeting overlay.
+    - Low vol: tilt heavily toward trend (momentum thrives in calm markets)
+    - High vol: reduce both, slight MR tilt (mean reversion in choppy markets)
+    - Very high vol: near-zero allocation (crash protection)
     """
-    # Run the two winning strategies
-    pos_trend = strategy_trend(data, alloc=0.55)
-    pos_mr = strategy_mean_reversion(data, alloc=0.45)
+    # Generate both strategies at full allocation for flexible weighting
+    pos_trend = strategy_trend(data, alloc=1.0)
+    pos_mr = strategy_mean_reversion(data, alloc=1.0)
 
-    # Sum positions
-    positions = pos_trend.add(pos_mr, fill_value=0)
+    # Compute vol regime
+    ref_index = _get_ref_index(data)
+    bpd = _bars_per_day(data)
+    spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
+    vol_lookback = max(5, int(20 * bpd))
+    realized_vol = spy_close.pct_change().rolling(vol_lookback).std()
+    baseline_vol = realized_vol.rolling(
+        max(20, int(90 * bpd)), min_periods=vol_lookback
+    ).median()
+    vol_ratio = (realized_vol / baseline_vol).fillna(1.0)
+
+    # Dynamic allocation: shift between trend and MR based on vol regime
+    trend_w = pd.Series(0.60, index=ref_index)
+    mr_w = pd.Series(0.40, index=ref_index)
+    # Low vol: concentrate in trend (momentum works best)
+    trend_w[vol_ratio < 0.8] = 0.95
+    mr_w[vol_ratio < 0.8] = 0.05
+    # High vol: balanced but reduced total
+    trend_w[vol_ratio > 1.5] = 0.40
+    mr_w[vol_ratio > 1.5] = 0.40
+    # Very high vol: near-zero (crash protection)
+    trend_w[vol_ratio > 2.5] = 0.05
+    mr_w[vol_ratio > 2.5] = 0.05
+
+    positions = pos_trend.mul(trend_w, axis=0).add(
+        pos_mr.mul(mr_w, axis=0), fill_value=0
+    )
+
+    # Vol targeting overlay: additional scale-down during elevated vol
+    vol_scale = pd.Series(1.0, index=ref_index)
+    vol_scale[vol_ratio > 1.5] = 0.85
+    vol_scale[vol_ratio > 2.5] = 0.50
+    positions = positions.mul(vol_scale, axis=0)
 
     return positions
 
