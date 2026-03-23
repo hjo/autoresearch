@@ -176,11 +176,13 @@ def strategy_mean_reversion(data, alloc=0.25):
         bb = ta.volatility.BollingerBands(close, window=min(bb_window, 20), window_dev=2)
         bb_lower = bb.bollinger_lband()
         bb_mid = bb.bollinger_mavg()
+        bb_upper = bb.bollinger_hband()
 
         for i in range(len(ref_index)):
             price_val = close.iloc[i]
             lower = bb_lower.iloc[i]
             mid = bb_mid.iloc[i]
+            upper = bb_upper.iloc[i]
 
             if pd.isna(lower) or pd.isna(mid):
                 continue
@@ -193,8 +195,8 @@ def strategy_mean_reversion(data, alloc=0.25):
                         stock_bars_held[t] = 1
             elif stock_bars_held[t] > 0:
                 stock_bars_held[t] += 1
-                # Exit: price reverts above middle band OR time stop
-                if price_val >= mid or stock_bars_held[t] > max_hold:
+                # Exit: price reaches upper band (let winners run) OR time stop
+                if price_val >= upper or stock_bars_held[t] > max_hold:
                     stock_bars_held[t] = 0
 
             if stock_bars_held[t] > 0:
