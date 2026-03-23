@@ -22,7 +22,7 @@ import yfinance as yf
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-# Diversified universe: tech + healthcare + financials + energy + consumer + industrial + bonds
+# Diversified universe: stocks + bonds + gold for all-weather allocation
 TICKERS = [
     # Tech
     "AAPL", "MSFT", "GOOGL", "NVDA",
@@ -36,6 +36,9 @@ TICKERS = [
     "PG", "COST",
     # Industrial
     "CAT",
+    # Safe havens (for bear regime rotation)
+    "TLT",   # 20+ year Treasury bonds
+    "GLD",   # Gold
     # Market index
     "SPY",
 ]

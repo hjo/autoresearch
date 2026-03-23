@@ -22,7 +22,11 @@ TRAILING_STOP = 0.05
 HYSTERESIS_UP = 1.015
 HYSTERESIS_DN = 0.985
 REENTRY_BAR = 1.02
-TOP_N = 3  # Hold top N stocks by momentum
+TOP_N = 3
+
+# Safe havens to rotate into during bear regime
+SAFE_HAVENS = ["TLT", "GLD"]
+SAFE_HAVEN_ALLOC = 0.50  # 50% into safe havens during bear (rest cash)
 
 
 def _bars_per_day(data):
@@ -37,14 +41,14 @@ def _bars_per_day(data):
 
 def generate_signals(data):
     """
-    SPY regime + concentrated momentum.
-    - Bull: hold TOP_N stocks by momentum, selected at regime entry, held throughout
-    - Bear/stopped: cash
-    - 5% trailing stop
+    All-weather regime strategy:
+    - Bull: top-3 momentum stocks
+    - Bear/stopped: rotate into safe havens (TLT + GLD)
+    - 5% trailing stop (tightens to 3% after 5% gain)
     """
     tickers = list(data.keys())
-    stock_tickers = [t for t in tickers if t != 'SPY']
-    n_stocks = len(stock_tickers)
+    stock_tickers = [t for t in tickers if t not in ('SPY',) + tuple(SAFE_HAVENS)]
+    available_havens = [h for h in SAFE_HAVENS if h in tickers]
 
     ref_index = next(iter(data.values())).index
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
@@ -65,7 +69,7 @@ def generate_signals(data):
 
     state = 0
     spy_peak = 0.0
-    spy_entry = 0.0  # price at bull entry
+    spy_entry = 0.0
     selected = []
     weight = 0.0
 
@@ -81,7 +85,6 @@ def generate_signals(data):
 
         if state == 1:
             spy_peak = max(spy_peak, price)
-            # Adaptive trailing stop: tighten after accumulating gains
             gain = (spy_peak / spy_entry - 1) if spy_entry > 0 else 0
             stop_pct = 0.03 if gain > 0.05 else TRAILING_STOP
             if price < spy_peak * (1 - stop_pct):
@@ -111,7 +114,7 @@ def generate_signals(data):
                 state = -1
 
         if state == 1:
-            # Select stocks on entry to bull regime
+            # Bull: top-N momentum stocks
             if prev_state != 1:
                 mom = momentum.iloc[i]
                 valid = mom.dropna()
@@ -123,8 +126,13 @@ def generate_signals(data):
 
             for t in selected:
                 positions.loc[ref_index[i], t] = weight
-        else:
-            selected = []
+
+        elif state in (-1, 2):
+            # Bear/stopped: rotate into safe havens
+            if available_havens:
+                haven_weight = SAFE_HAVEN_ALLOC / len(available_havens)
+                for h in available_havens:
+                    positions.loc[ref_index[i], h] = haven_weight
 
     return positions
 
