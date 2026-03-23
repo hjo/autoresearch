@@ -67,6 +67,10 @@ def generate_signals(data):
     )
     momentum = close_matrix.pct_change(mom_bars)
 
+    # Gold trend for conditional safe haven
+    gld_close = data['GLD']['Close'].reindex(ref_index, method='ffill') if 'GLD' in data else None
+    gld_sma = gld_close.rolling(slow_bars).mean() if gld_close is not None else None
+
     state = 0
     spy_peak = 0.0
     spy_entry = 0.0
@@ -128,11 +132,13 @@ def generate_signals(data):
                 positions.loc[ref_index[i], t] = weight
 
         elif state in (-1, 2):
-            # Bear/stopped: rotate into safe havens
-            if available_havens:
-                haven_weight = SAFE_HAVEN_ALLOC / len(available_havens)
-                for h in available_havens:
-                    positions.loc[ref_index[i], h] = haven_weight
+            # Bear/stopped: rotate into gold ONLY if gold is trending up
+            if gld_close is not None and gld_sma is not None:
+                g = gld_close.iloc[i]
+                gs = gld_sma.iloc[i]
+                if not pd.isna(gs) and g > gs:
+                    positions.loc[ref_index[i], 'GLD'] = SAFE_HAVEN_ALLOC
+            # Otherwise stay in cash
 
     return positions
 
