@@ -1,5 +1,5 @@
 """
-Trading strategy — the file the agent modifies.
+Multi-strategy portfolio: combine uncorrelated strategies for higher Sharpe.
 Usage:
     uv run strategy.py                  # Quick: train/val on hourly data
     uv run strategy.py --walk-forward   # Robust: walk-forward on 10y daily data
@@ -16,18 +16,9 @@ from prepare import (
 )
 
 
-FAST_SMA_DAYS = 7
-SLOW_SMA_DAYS = 19
-TRAILING_STOP = 0.05
-HYSTERESIS_UP = 1.015
-HYSTERESIS_DN = 0.985
-REENTRY_BAR = 1.02
-TOP_N = 3
-
-# Safe havens to rotate into during bear regime
-SAFE_HAVENS = ["GLD"]
-SAFE_HAVEN_ALLOC = 0.50  # 50% into gold during bear (rest cash)
-
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
 
 def _bars_per_day(data):
     idx = next(iter(data.values())).index
@@ -39,41 +30,41 @@ def _bars_per_day(data):
     return 1
 
 
-def generate_signals(data):
-    """
-    All-weather regime strategy:
-    - Bull: top-3 momentum stocks
-    - Bear/stopped: rotate into safe havens (TLT + GLD)
-    - 5% trailing stop (tightens to 3% after 5% gain)
-    """
-    tickers = list(data.keys())
-    stock_tickers = [t for t in tickers if t not in ('SPY',) + tuple(SAFE_HAVENS)]
-    available_havens = [h for h in SAFE_HAVENS if h in tickers]
+def _get_ref_index(data):
+    return next(iter(data.values())).index
 
-    ref_index = next(iter(data.values())).index
+
+def _get_tickers(data, exclude=()):
+    return [t for t in data.keys() if t not in exclude]
+
+
+# ---------------------------------------------------------------------------
+# Strategy 1: TREND (our proven regime strategy)
+# Allocation: 40% of capital
+# ---------------------------------------------------------------------------
+
+def strategy_trend(data, alloc=0.40):
+    """SPY regime + top-3 momentum + adaptive trailing stop + conditional gold."""
+    tickers = list(data.keys())
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    ref_index = _get_ref_index(data)
     positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
 
     bpd = _bars_per_day(data)
-    fast_bars = max(2, int(FAST_SMA_DAYS * bpd))
-    slow_bars = max(5, int(SLOW_SMA_DAYS * bpd))
+    fast_bars = max(2, int(7 * bpd))
+    slow_bars = max(5, int(19 * bpd))
     mom_bars = max(5, int(15 * bpd))
 
     spy_close = data['SPY']['Close'].reindex(ref_index, method='ffill')
-    spy_high = data['SPY']['High'].reindex(ref_index, method='ffill') if 'High' in data['SPY'].columns else spy_close
-    spy_low = data['SPY']['Low'].reindex(ref_index, method='ffill') if 'Low' in data['SPY'].columns else spy_close
     spy_fast = spy_close.rolling(fast_bars).mean()
     spy_slow = spy_close.rolling(slow_bars).mean()
-
-    # RSI for exposure scaling
-    rsi_period = max(5, int(14 * bpd))
-    spy_rsi = ta.momentum.RSIIndicator(spy_close, window=min(rsi_period, 14)).rsi()
+    spy_rsi = ta.momentum.RSIIndicator(spy_close, window=14).rsi()
 
     close_matrix = pd.DataFrame(
         {t: data[t]['Close'].reindex(ref_index, method='ffill') for t in stock_tickers}
     )
     momentum = close_matrix.pct_change(mom_bars)
 
-    # Gold trend for conditional safe haven
     gld_close = data['GLD']['Close'].reindex(ref_index, method='ffill') if 'GLD' in data else None
     gld_sma = gld_close.rolling(slow_bars).mean() if gld_close is not None else None
 
@@ -82,13 +73,13 @@ def generate_signals(data):
     spy_entry = 0.0
     selected = []
     weight = 0.0
-    exposure_mult = 1.0  # RSI-based exposure multiplier
+    exposure_mult = 1.0
+    TOP_N = 3
 
     for i in range(len(ref_index)):
         f = spy_fast.iloc[i]
         s = spy_slow.iloc[i]
         price = spy_close.iloc[i]
-
         if pd.isna(f) or pd.isna(s):
             continue
 
@@ -97,35 +88,34 @@ def generate_signals(data):
         if state == 1:
             spy_peak = max(spy_peak, price)
             gain = (spy_peak / spy_entry - 1) if spy_entry > 0 else 0
-            stop_pct = 0.03 if gain > 0.05 else TRAILING_STOP
+            stop_pct = 0.03 if gain > 0.05 else 0.05
             if price < spy_peak * (1 - stop_pct):
                 state = 2
                 spy_peak = 0.0
-            elif f < s * HYSTERESIS_DN:
+            elif f < s * 0.985:
                 state = -1
                 spy_peak = 0.0
         elif state == -1:
-            if f > s * HYSTERESIS_UP:
+            if f > s * 1.015:
                 state = 1
                 spy_peak = price
                 spy_entry = price
         elif state == 2:
-            if f > s * REENTRY_BAR:
+            if f > s * 1.02:
                 state = 1
                 spy_peak = price
                 spy_entry = price
-            elif f < s * HYSTERESIS_DN:
+            elif f < s * 0.985:
                 state = -1
         elif state == 0:
-            if f > s * HYSTERESIS_UP:
+            if f > s * 1.015:
                 state = 1
                 spy_peak = price
                 spy_entry = price
-            elif f < s * HYSTERESIS_DN:
+            elif f < s * 0.985:
                 state = -1
 
         if state == 1:
-            # Bull: top-N momentum stocks
             if prev_state != 1:
                 mom = momentum.iloc[i]
                 valid = mom.dropna()
@@ -133,32 +123,194 @@ def generate_signals(data):
                     selected = valid.nlargest(TOP_N).index.tolist()
                 else:
                     selected = stock_tickers[:TOP_N]
-                weight = 1.0 / len(selected)
-                exposure_mult = 1.0  # reset on entry
+                weight = alloc / len(selected)
+                exposure_mult = 1.0
 
-            # RSI exposure scaling (discrete jumps at extremes)
             rsi_val = spy_rsi.iloc[i] if not pd.isna(spy_rsi.iloc[i]) else 50
-            if rsi_val < 30:
-                exposure_mult = 1.3   # buy the dip
-            elif rsi_val > 70:
-                exposure_mult = 0.5   # take profit
+            if rsi_val > 70:
+                exposure_mult = 0.5
             elif 40 < rsi_val < 60:
-                exposure_mult = 1.0   # normal
+                exposure_mult = 1.0
 
             for t in selected:
                 positions.loc[ref_index[i], t] = weight * exposure_mult
 
         elif state in (-1, 2):
-            # Bear/stopped: rotate into gold ONLY if gold is trending up
             if gld_close is not None and gld_sma is not None:
                 g = gld_close.iloc[i]
                 gs = gld_sma.iloc[i]
                 if not pd.isna(gs) and g > gs:
-                    positions.loc[ref_index[i], 'GLD'] = SAFE_HAVEN_ALLOC
-            # Otherwise stay in cash
+                    positions.loc[ref_index[i], 'GLD'] = alloc * 0.5
 
     return positions
 
+
+# ---------------------------------------------------------------------------
+# Strategy 2: MEAN REVERSION (Bollinger Band bounce)
+# Allocation: 25% of capital
+# Uncorrelated with trend: profits during choppy/range-bound markets
+# ---------------------------------------------------------------------------
+
+def strategy_mean_reversion(data, alloc=0.25):
+    """
+    Buy individual stocks at Bollinger Band extremes (oversold).
+    Hold until price reverts to the mean. No shorting.
+    Uses state tracking per stock to avoid continuous rebalancing.
+    """
+    tickers = list(data.keys())
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    ref_index = _get_ref_index(data)
+    positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
+
+    bpd = _bars_per_day(data)
+    bb_window = max(10, int(20 * bpd))
+    max_positions = 3  # max 3 simultaneous mean reversion trades
+    per_stock_weight = alloc / max_positions
+
+    # Per-stock Bollinger Bands and state
+    stock_states = {t: 0 for t in stock_tickers}  # 0=flat, 1=long (waiting for reversion)
+
+    for t in stock_tickers:
+        close = data[t]['Close'].reindex(ref_index, method='ffill')
+        bb = ta.volatility.BollingerBands(close, window=min(bb_window, 20), window_dev=2)
+        bb_lower = bb.bollinger_lband()
+        bb_mid = bb.bollinger_mavg()
+
+        for i in range(len(ref_index)):
+            price_val = close.iloc[i]
+            lower = bb_lower.iloc[i]
+            mid = bb_mid.iloc[i]
+
+            if pd.isna(lower) or pd.isna(mid):
+                continue
+
+            if stock_states[t] == 0:
+                # Entry: price touches lower band
+                if price_val <= lower:
+                    # Check how many positions are open
+                    active = sum(1 for s in stock_states.values() if s == 1)
+                    if active < max_positions:
+                        stock_states[t] = 1
+            elif stock_states[t] == 1:
+                # Exit: price reverts above middle band
+                if price_val >= mid:
+                    stock_states[t] = 0
+
+            if stock_states[t] == 1:
+                positions.loc[ref_index[i], t] = per_stock_weight
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Strategy 3: CROSS-SECTIONAL RELATIVE VALUE (market neutral)
+# Allocation: 20% of capital
+# Long recent losers, short recent winners (short-term reversal)
+# Rebalance weekly to minimize turnover
+# ---------------------------------------------------------------------------
+
+def strategy_relative_value(data, alloc=0.20):
+    """
+    Short-term reversal: long recent losers, short recent winners.
+    Market-neutral (equal long/short). Rebalance every 5 days.
+    """
+    tickers = list(data.keys())
+    stock_tickers = _get_tickers(data, exclude=('SPY', 'GLD', 'TLT'))
+    ref_index = _get_ref_index(data)
+    positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
+
+    bpd = _bars_per_day(data)
+    lookback = max(3, int(5 * bpd))  # 5-day return for reversal signal
+    rebal_period = max(1, int(5 * bpd))  # rebalance every 5 days
+    n_long = 3
+    n_short = 3
+    long_weight = (alloc * 0.5) / n_long
+    short_weight = (alloc * 0.5) / n_short
+
+    close_matrix = pd.DataFrame(
+        {t: data[t]['Close'].reindex(ref_index, method='ffill') for t in stock_tickers}
+    )
+    returns = close_matrix.pct_change(lookback)
+
+    current_longs = []
+    current_shorts = []
+
+    for i in range(lookback, len(ref_index)):
+        if i % rebal_period == 0:
+            ret = returns.iloc[i]
+            valid = ret.dropna()
+            if len(valid) >= n_long + n_short:
+                # Reversal: long the losers, short the winners
+                current_longs = valid.nsmallest(n_long).index.tolist()
+                current_shorts = valid.nlargest(n_short).index.tolist()
+
+        for t in current_longs:
+            positions.loc[ref_index[i], t] += long_weight
+        for t in current_shorts:
+            positions.loc[ref_index[i], t] -= short_weight
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Strategy 4: GOLD MOMENTUM (independent asset class)
+# Allocation: 15% of capital
+# Simple trend following on gold — uncorrelated with equity strategies
+# ---------------------------------------------------------------------------
+
+def strategy_gold_momentum(data, alloc=0.15):
+    """
+    Simple gold trend following.
+    Long GLD when gold is above its 15-day SMA. Cash otherwise.
+    """
+    tickers = list(data.keys())
+    ref_index = _get_ref_index(data)
+    positions = pd.DataFrame(0.0, index=ref_index, columns=tickers)
+
+    if 'GLD' not in data:
+        return positions
+
+    bpd = _bars_per_day(data)
+    sma_bars = max(5, int(15 * bpd))
+
+    gld_close = data['GLD']['Close'].reindex(ref_index, method='ffill')
+    gld_sma = gld_close.rolling(sma_bars).mean()
+
+    for i in range(len(ref_index)):
+        price = gld_close.iloc[i]
+        sma = gld_sma.iloc[i]
+        if pd.isna(sma):
+            continue
+        if price > sma * 1.005:  # small hysteresis
+            positions.loc[ref_index[i], 'GLD'] = alloc
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Combined: merge all strategies
+# ---------------------------------------------------------------------------
+
+def generate_signals(data):
+    """
+    Multi-strategy portfolio combining 4 uncorrelated strategies.
+    Total allocation: 40% + 25% + 20% + 15% = 100%
+    """
+    # Run each strategy independently
+    pos_trend = strategy_trend(data, alloc=0.40)
+    pos_mr = strategy_mean_reversion(data, alloc=0.25)
+    pos_rv = strategy_relative_value(data, alloc=0.20)
+    pos_gold = strategy_gold_momentum(data, alloc=0.15)
+
+    # Sum positions (each strategy uses its own allocation slice)
+    positions = pos_trend.add(pos_mr, fill_value=0).add(pos_rv, fill_value=0).add(pos_gold, fill_value=0)
+
+    return positions
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import sys
@@ -168,20 +320,36 @@ if __name__ == "__main__":
     if "--walk-forward" in sys.argv:
         print("Running walk-forward analysis (10y daily data)...")
         print("=" * 60)
+
+        # Run combined
         wf = walk_forward(generate_signals)
+
+        # Also run individual strategies for comparison
+        wf_trend = walk_forward(lambda d: strategy_trend(d, 1.0))
+        wf_mr = walk_forward(lambda d: strategy_mean_reversion(d, 1.0))
+        wf_rv = walk_forward(lambda d: strategy_relative_value(d, 1.0))
+        wf_gold = walk_forward(lambda d: strategy_gold_momentum(d, 1.0))
+
         elapsed = time.time() - start_time
 
-        print(f"Windows:              {wf['n_windows']}")
-        print(f"Avg Sharpe:           {wf['avg_sharpe']:.4f}")
-        print(f"Median Sharpe:        {wf['median_sharpe']:.4f}")
-        print(f"Std Sharpe:           {wf['std_sharpe']:.4f}")
-        print(f"Min/Max Sharpe:       {wf['min_sharpe']:.4f} / {wf['max_sharpe']:.4f}")
-        print(f"% Positive Sharpe:    {wf['pct_positive_sharpe']:.1%}")
-        print(f"Avg Return:           {wf['avg_return']:.4f}")
-        print(f"Avg Max Drawdown:     {wf['avg_max_drawdown']:.4f}")
-        print(f"Worst Drawdown:       {wf['worst_drawdown']:.4f}")
-        print(f"Avg Win Rate:         {wf['avg_win_rate']:.4f}")
-        print(f"Total seconds:        {elapsed:.1f}")
+        print(f"{'Strategy':<20} {'Avg Sharpe':>10} {'Median':>8} {'%Pos':>6} {'AvgRet':>8}")
+        print("-" * 55)
+        for name, w in [("TREND", wf_trend), ("MEAN REVERT", wf_mr),
+                         ("REL VALUE", wf_rv), ("GOLD MOM", wf_gold),
+                         ("** COMBINED **", wf)]:
+            print(f"{name:<20} {w['avg_sharpe']:>10.4f} {w['median_sharpe']:>8.4f} "
+                  f"{w['pct_positive_sharpe']:>5.0%} {w['avg_return']:>8.4f}")
+
+        print()
+        print(f"COMBINED walk-forward details:")
+        print(f"  Avg Sharpe:         {wf['avg_sharpe']:.4f}")
+        print(f"  Median Sharpe:      {wf['median_sharpe']:.4f}")
+        print(f"  Std Sharpe:         {wf['std_sharpe']:.4f}")
+        print(f"  Min/Max Sharpe:     {wf['min_sharpe']:.4f} / {wf['max_sharpe']:.4f}")
+        print(f"  % Positive:         {wf['pct_positive_sharpe']:.1%}")
+        print(f"  Avg Return:         {wf['avg_return']:.4f}")
+        print(f"  Worst Drawdown:     {wf['worst_drawdown']:.4f}")
+        print(f"  Total seconds:      {elapsed:.1f}")
         print()
         print("Per-window results:")
         print(f"{'Test Period':<26} {'Sharpe':>8} {'Return':>8} {'MaxDD':>8} {'Trades':>7}")
