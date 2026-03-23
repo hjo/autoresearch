@@ -65,7 +65,8 @@ def generate_signals(data):
 
     state = 0
     spy_peak = 0.0
-    selected = []  # stocks selected at bull entry
+    spy_entry = 0.0  # price at bull entry
+    selected = []
     weight = 0.0
 
     for i in range(len(ref_index)):
@@ -80,7 +81,10 @@ def generate_signals(data):
 
         if state == 1:
             spy_peak = max(spy_peak, price)
-            if price < spy_peak * (1 - TRAILING_STOP):
+            # Adaptive trailing stop: tighten after accumulating gains
+            gain = (spy_peak / spy_entry - 1) if spy_entry > 0 else 0
+            stop_pct = 0.03 if gain > 0.05 else TRAILING_STOP
+            if price < spy_peak * (1 - stop_pct):
                 state = 2
                 spy_peak = 0.0
             elif f < s * HYSTERESIS_DN:
@@ -90,16 +94,19 @@ def generate_signals(data):
             if f > s * HYSTERESIS_UP:
                 state = 1
                 spy_peak = price
+                spy_entry = price
         elif state == 2:
             if f > s * REENTRY_BAR:
                 state = 1
                 spy_peak = price
+                spy_entry = price
             elif f < s * HYSTERESIS_DN:
                 state = -1
         elif state == 0:
             if f > s * HYSTERESIS_UP:
                 state = 1
                 spy_peak = price
+                spy_entry = price
             elif f < s * HYSTERESIS_DN:
                 state = -1
 
