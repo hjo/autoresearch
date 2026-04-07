@@ -17,9 +17,10 @@ Prerequisites:
 
 import argparse
 import asyncio
+import logging
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -27,6 +28,41 @@ import yfinance as yf
 
 from strategy import generate_signals
 from prepare import TICKERS, COMMISSION_BPS
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("trades.log", mode="a"),
+    ],
+)
+log = logging.getLogger("autotrader")
+
+
+# ---------------------------------------------------------------------------
+# Market hours
+# ---------------------------------------------------------------------------
+
+def is_market_open():
+    """Check if US equity markets are currently open (roughly)."""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo("America/New_York"))
+    # Weekday check (Mon=0, Fri=4)
+    if now.weekday() > 4:
+        return False, f"Weekend ({now.strftime('%A')})"
+    # Hours check (9:30 AM - 4:00 PM ET)
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now < market_open:
+        return False, f"Pre-market ({now.strftime('%H:%M')} ET, opens 09:30)"
+    if now > market_close:
+        return False, f"After-hours ({now.strftime('%H:%M')} ET, closed 16:00)"
+    return True, f"Market open ({now.strftime('%H:%M')} ET)"
 
 
 # ---------------------------------------------------------------------------
@@ -219,27 +255,34 @@ def submit_ibkr_orders(ib, orders):
 # Main execution modes
 # ---------------------------------------------------------------------------
 
-def run_live(port, dry_run=False, capital=10_000):
+def run_live(port, dry_run=False, capital=10_000, force=False):
     """Full execution: connect to IBKR, compute signals, submit orders."""
     from ib_async import IB, util
+
+    # Market hours check
+    market_open, market_status = is_market_open()
+    log.info(f"Market status: {market_status}")
+    if not market_open and not force:
+        log.warning("Market is closed. Use --force to override.")
+        return
+
     util.startLoop()  # enable sync API usage
 
-    print(f"Connecting to IBKR on port {port}...")
+    log.info(f"Connecting to IBKR on port {port}...")
     ib = IB()
     try:
         import random
         client_id = random.randint(100, 999)
         ib.connect("127.0.0.1", port, clientId=client_id, timeout=15)
     except Exception as e:
-        print(f"ERROR: Could not connect to IBKR on port {port}")
-        print(f"  {e}")
-        print(f"  Make sure IB Gateway or TWS is running.")
+        log.error(f"Could not connect to IBKR on port {port}: {e}")
+        log.error("Make sure IB Gateway or TWS is running.")
         return
 
     try:
         accounts = ib.managedAccounts()
-        print(f"Connected. Account(s): {accounts}")
-        print(f"Using capital: ${capital:,.2f}")
+        log.info(f"Connected. Account(s): {accounts}")
+        log.info(f"Using capital: ${capital:,.2f}")
 
         # Fetch current positions
         ibkr_positions = get_ibkr_positions(ib)
@@ -369,24 +412,33 @@ def main():
         "--capital", type=float, default=10_000,
         help="Capital for dry run (default: $10,000)"
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Execute even if market is closed"
+    )
+    parser.add_argument(
+        "--confirm-live", action="store_true",
+        help="Skip interactive confirmation for live mode (for automation)"
+    )
     args = parser.parse_args()
 
     if args.live:
         port = args.port or 4001
-        print("=" * 50)
-        print("  WARNING: LIVE TRADING MODE")
-        print(f"  Connecting to port {port}")
-        print("=" * 50)
-        confirm = input("Type 'yes' to proceed: ")
-        if confirm.strip().lower() != "yes":
-            print("Aborted.")
-            return
-        run_live(port, dry_run=False, capital=args.capital)
+        if not args.confirm_live:
+            print("=" * 50)
+            print("  WARNING: LIVE TRADING MODE")
+            print(f"  Connecting to port {port}")
+            print("=" * 50)
+            confirm = input("Type 'yes' to proceed: ")
+            if confirm.strip().lower() != "yes":
+                print("Aborted.")
+                return
+        run_live(port, dry_run=False, capital=args.capital, force=args.force)
 
     elif args.paper:
         port = args.port or 4002
-        print(f"Paper trading mode (port {port})")
-        run_live(port, dry_run=False, capital=args.capital)
+        log.info(f"Paper trading mode (port {port})")
+        run_live(port, dry_run=False, capital=args.capital, force=args.force)
 
     else:
         run_dry()

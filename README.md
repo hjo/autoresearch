@@ -1,6 +1,6 @@
 # autotrader
 
-Dual-strategy equity portfolio (Trend + Mean Reversion) with dynamic volatility-regime allocation and live IBKR execution.
+Dual-strategy equity portfolio (Trend + Mean Reversion) with dynamic volatility-regime allocation and automated IBKR execution.
 
 ## Performance (walk-forward, 10 years, 13 six-month windows)
 
@@ -11,6 +11,8 @@ Dual-strategy equity portfolio (Trend + Mean Reversion) with dynamic volatility-
 | % Positive Windows | 100% |
 | Avg 6-Month Return | 15.4% |
 | Worst Drawdown | -8.8% |
+
+Robustness: parameters stable within +-20% perturbation, edge survives 3x commissions, bootstrap 90% CI [1.66, 2.91].
 
 ## How it works
 
@@ -53,7 +55,7 @@ uv run strategy.py
 
 ## Live execution
 
-Requires IBKR account with IB Gateway or TWS running locally.
+Requires IBKR account with IB Gateway running.
 
 ```bash
 # Dry run — shows target portfolio, no connection needed
@@ -64,14 +66,40 @@ uv run execute.py --paper
 
 # Live trading (port 4001, asks confirmation)
 uv run execute.py --live
+
+# Live trading, automated (no interactive prompt, for cron/scheduler)
+uv run execute.py --live --confirm-live --capital 10000
 ```
+
+Market hours are enforced by default (9:30 AM - 4:00 PM ET, weekdays). Use `--force` to override.
+
+All trades are logged to `trades.log`.
+
+## Automated daily execution
+
+Run once daily near market close (3:45 PM ET). Example cron entry:
+
+```cron
+45 15 * * 1-5 cd /path/to/autoresearch && uv run execute.py --paper --capital 10000 >> cron.log 2>&1
+```
+
+For fully automated live trading:
+
+```cron
+45 15 * * 1-5 cd /path/to/autoresearch && uv run execute.py --live --confirm-live --capital 10000 >> cron.log 2>&1
+```
+
+**Prerequisites for automation:**
+- IB Gateway running and logged in (use [IBC](https://github.com/IbcAlpha/IBC) for auto-login)
+- Market data: delayed data (free) works fine, or subscribe to live data ($4.50/mo per exchange)
 
 ## Project structure
 
 ```
 prepare.py      — data download, caching, backtest engine, walk-forward framework
 strategy.py     — trend + mean reversion strategies, dynamic allocation, signal generation
-execute.py      — IBKR execution engine (dry run / paper / live)
+execute.py      — IBKR execution engine (dry run / paper / live / automated)
+trades.log      — execution log (appended each run)
 pyproject.toml  — dependencies
 ```
 
