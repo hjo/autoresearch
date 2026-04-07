@@ -129,21 +129,11 @@ def compute_orders(current_positions, target_positions, prices):
 # IBKR connection and execution
 # ---------------------------------------------------------------------------
 
-async def connect_ibkr(port, client_id=1):
-    """Connect to IBKR and return the IB instance."""
-    from ib_async import IB
-    ib = IB()
-    await ib.connectAsync("127.0.0.1", port, clientId=client_id)
-    return ib
-
-
-async def get_ibkr_positions(ib):
-    """Fetch current positions from IBKR as dict of ticker -> dollar_value."""
+def get_ibkr_positions(ib):
+    """Fetch current positions from IBKR."""
     positions = {}
     for pos in ib.positions():
         ticker = pos.contract.symbol
-        # pos.position is signed quantity, pos.avgCost is per-share cost
-        # We need current market value, so fetch price
         positions[ticker] = {
             "shares": float(pos.position),
             "avg_cost": float(pos.avgCost),
@@ -151,41 +141,55 @@ async def get_ibkr_positions(ib):
     return positions
 
 
-async def get_ibkr_account_value(ib):
+def get_ibkr_account_value(ib):
     """Fetch net liquidation value from IBKR."""
-    account_values = ib.accountSummary()
-    for av in account_values:
+    from ib_async import util
+    account = ib.managedAccounts()[0]
+    ib.reqAccountUpdates(account=account)
+    util.sleep(3)  # wait for data to arrive
+    for av in ib.accountValues():
         if av.tag == "NetLiquidation" and av.currency == "USD":
-            return float(av.value)
-    # Fallback: request it
-    summary = await ib.reqAccountSummaryAsync()
-    for av in summary:
-        if av.tag == "NetLiquidation" and av.currency == "USD":
-            ib.cancelAccountSummary(summary)
             return float(av.value)
     return None
 
 
-async def get_ibkr_prices(ib, tickers):
-    """Fetch current prices from IBKR for given tickers."""
-    from ib_async import Stock
+def get_ibkr_prices(ib, tickers, yf_data=None):
+    """Fetch current prices. Try IBKR delayed data, fall back to yfinance."""
+    from ib_async import Stock, util
     prices = {}
-    for ticker in tickers:
-        contract = Stock(ticker, "SMART", "USD")
-        ib.qualifyContracts(contract)
-        ticker_data = ib.reqMktData(contract, "", False, False)
-        await asyncio.sleep(0.5)  # allow data to arrive
-        if ticker_data.last and ticker_data.last > 0:
-            prices[ticker] = ticker_data.last
-        elif ticker_data.close and ticker_data.close > 0:
-            prices[ticker] = ticker_data.close
-        ib.cancelMktData(contract)
+
+    # Request delayed market data (free, no subscription needed)
+    ib.reqMarketDataType(3)  # 3 = delayed
+
+    tradeable = [t for t in tickers if not t.startswith("^")]
+    for ticker in tradeable:
+        try:
+            contract = Stock(ticker, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            ticker_data = ib.reqMktData(contract, "", False, False)
+            util.sleep(1)
+            price = (ticker_data.last if ticker_data.last and ticker_data.last > 0
+                     else ticker_data.close if ticker_data.close and ticker_data.close > 0
+                     else ticker_data.marketPrice() if ticker_data.marketPrice() > 0
+                     else None)
+            if price and price > 0:
+                prices[ticker] = price
+            ib.cancelMktData(contract)
+        except Exception:
+            pass
+
+    # Fall back to yfinance for any missing prices
+    if yf_data:
+        for ticker in tradeable:
+            if ticker not in prices and ticker in yf_data and not yf_data[ticker].empty:
+                prices[ticker] = float(yf_data[ticker]["Close"].iloc[-1])
+
     return prices
 
 
-async def submit_orders(ib, orders):
+def submit_ibkr_orders(ib, orders):
     """Submit orders to IBKR. Returns list of trade objects."""
-    from ib_async import Stock, MarketOrder
+    from ib_async import Stock, MarketOrder, util
     trades = []
     for order in orders:
         contract = Stock(order["ticker"], "SMART", "USD")
@@ -199,9 +203,8 @@ async def submit_orders(ib, orders):
     # Wait for fills (up to 30 seconds)
     deadline = time.time() + 30
     while time.time() < deadline:
-        await asyncio.sleep(1)
-        all_done = all(t.isDone() for t in trades)
-        if all_done:
+        ib.sleep(1)
+        if all(t.isDone() for t in trades):
             break
 
     for trade in trades:
@@ -216,14 +219,17 @@ async def submit_orders(ib, orders):
 # Main execution modes
 # ---------------------------------------------------------------------------
 
-async def run_live(port, dry_run=False):
+def run_live(port, dry_run=False, capital=10_000):
     """Full execution: connect to IBKR, compute signals, submit orders."""
-    from ib_async import IB
+    from ib_async import IB, util
+    util.startLoop()  # enable sync API usage
 
     print(f"Connecting to IBKR on port {port}...")
     ib = IB()
     try:
-        await ib.connectAsync("127.0.0.1", port, clientId=1)
+        import random
+        client_id = random.randint(100, 999)
+        ib.connect("127.0.0.1", port, clientId=client_id, timeout=15)
     except Exception as e:
         print(f"ERROR: Could not connect to IBKR on port {port}")
         print(f"  {e}")
@@ -233,24 +239,22 @@ async def run_live(port, dry_run=False):
     try:
         accounts = ib.managedAccounts()
         print(f"Connected. Account(s): {accounts}")
-
-        # Get account value
-        capital = await get_ibkr_account_value(ib)
-        if capital is None:
-            print("ERROR: Could not determine account value")
-            return
-        print(f"Net liquidation value: ${capital:,.2f}")
+        print(f"Using capital: ${capital:,.2f}")
 
         # Fetch current positions
-        ibkr_positions = await get_ibkr_positions(ib)
+        ibkr_positions = get_ibkr_positions(ib)
         print(f"\nCurrent positions ({len(ibkr_positions)}):")
         for ticker, info in sorted(ibkr_positions.items()):
             print(f"  {ticker}: {info['shares']:.0f} shares @ ${info['avg_cost']:.2f}")
 
-        # Fetch prices from IBKR
-        all_tickers = set(TICKERS) | set(ibkr_positions.keys())
-        print(f"\nFetching prices for {len(all_tickers)} tickers...")
-        prices = await get_ibkr_prices(ib, list(all_tickers))
+        # Fetch recent market data for strategy signals (also used as price fallback)
+        print("\nFetching recent daily data for strategy signals...")
+        data = fetch_recent_data(TICKERS)
+
+        # Fetch prices (IBKR delayed, fallback to yfinance)
+        all_tickers = list(set(TICKERS) | set(ibkr_positions.keys()))
+        print(f"Fetching prices for {len(all_tickers)} tickers...")
+        prices = get_ibkr_prices(ib, all_tickers, yf_data=data)
 
         # Current dollar positions
         current_dollar = {}
@@ -258,10 +262,6 @@ async def run_live(port, dry_run=False):
             price = prices.get(ticker)
             if price:
                 current_dollar[ticker] = info["shares"] * price
-
-        # Fetch recent market data and compute strategy signals
-        print("\nFetching recent daily data for strategy signals...")
-        data = fetch_recent_data(TICKERS)
         print(f"  Loaded {len(data)} tickers, "
               f"{len(next(iter(data.values())))} bars each")
 
@@ -298,7 +298,7 @@ async def run_live(port, dry_run=False):
 
         # Confirm
         print(f"\nSubmitting {len(orders)} orders...")
-        await submit_orders(ib, orders)
+        submit_ibkr_orders(ib, orders)
         print("\nDone.")
 
     finally:
@@ -381,12 +381,12 @@ def main():
         if confirm.strip().lower() != "yes":
             print("Aborted.")
             return
-        asyncio.run(run_live(port, dry_run=False))
+        run_live(port, dry_run=False, capital=args.capital)
 
     elif args.paper:
         port = args.port or 4002
         print(f"Paper trading mode (port {port})")
-        asyncio.run(run_live(port, dry_run=False))
+        run_live(port, dry_run=False, capital=args.capital)
 
     else:
         run_dry()
