@@ -66,7 +66,7 @@ def is_market_open():
 
 
 # ---------------------------------------------------------------------------
-# Data: fetch recent daily data for signal generation
+# Data: fetch market data for signal generation
 # ---------------------------------------------------------------------------
 
 def fetch_recent_data(tickers, lookback_days=250):
@@ -83,7 +83,54 @@ def fetch_recent_data(tickers, lookback_days=250):
             if not df.empty:
                 data[ticker] = df
         except Exception as e:
-            print(f"  WARNING: Failed to fetch {ticker}: {e}")
+            log.warning(f"Failed to fetch {ticker} from yfinance: {e}")
+    return data
+
+
+def fetch_hourly_data_ibkr(ib, tickers, duration="1 Y"):
+    """Fetch hourly bars from IBKR for all tickers."""
+    from ib_async import Stock
+    data = {}
+    tradeable = [t for t in tickers if not t.startswith("^")]
+
+    for ticker in tradeable:
+        try:
+            contract = Stock(ticker, "SMART", "USD")
+            ib.qualifyContracts(contract)
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting="1 hour",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            if bars:
+                df = pd.DataFrame([{
+                    "Open": b.open, "High": b.high, "Low": b.low,
+                    "Close": b.close, "Volume": b.volume,
+                } for b in bars], index=pd.DatetimeIndex([b.date for b in bars]))
+                data[ticker] = df
+                log.info(f"  {ticker}: {len(bars)} hourly bars")
+            else:
+                log.warning(f"  {ticker}: no hourly data returned")
+        except Exception as e:
+            log.warning(f"  {ticker}: hourly fetch failed: {e}")
+
+    # VIX: use yfinance (not tradeable on IBKR as stock)
+    if "^VIX" in tickers:
+        try:
+            vix = yf.download("^VIX", period="2y", interval="1h",
+                              progress=False, auto_adjust=True)
+            if isinstance(vix.columns, pd.MultiIndex):
+                vix.columns = vix.columns.get_level_values(0)
+            if not vix.empty:
+                data["^VIX"] = vix
+                log.info(f"  ^VIX: {len(vix)} hourly bars (yfinance)")
+        except Exception:
+            pass
+
     return data
 
 
@@ -255,7 +302,7 @@ def submit_ibkr_orders(ib, orders):
 # Main execution modes
 # ---------------------------------------------------------------------------
 
-def run_live(port, dry_run=False, capital=10_000, force=False):
+def run_live(port, dry_run=False, capital=10_000, force=False, hourly=False):
     """Full execution: connect to IBKR, compute signals, submit orders."""
     from ib_async import IB, util
 
@@ -283,20 +330,25 @@ def run_live(port, dry_run=False, capital=10_000, force=False):
         accounts = ib.managedAccounts()
         log.info(f"Connected. Account(s): {accounts}")
         log.info(f"Using capital: ${capital:,.2f}")
+        log.info(f"Mode: {'hourly' if hourly else 'daily'}")
 
         # Fetch current positions
         ibkr_positions = get_ibkr_positions(ib)
-        print(f"\nCurrent positions ({len(ibkr_positions)}):")
+        log.info(f"Current positions ({len(ibkr_positions)}):")
         for ticker, info in sorted(ibkr_positions.items()):
-            print(f"  {ticker}: {info['shares']:.0f} shares @ ${info['avg_cost']:.2f}")
+            log.info(f"  {ticker}: {info['shares']:.0f} shares @ ${info['avg_cost']:.2f}")
 
-        # Fetch recent market data for strategy signals (also used as price fallback)
-        print("\nFetching recent daily data for strategy signals...")
-        data = fetch_recent_data(TICKERS)
+        # Fetch market data for strategy signals
+        if hourly:
+            log.info("Fetching hourly data from IBKR...")
+            data = fetch_hourly_data_ibkr(ib, TICKERS)
+        else:
+            log.info("Fetching daily data from yfinance...")
+            data = fetch_recent_data(TICKERS)
 
         # Fetch prices (IBKR delayed, fallback to yfinance)
         all_tickers = list(set(TICKERS) | set(ibkr_positions.keys()))
-        print(f"Fetching prices for {len(all_tickers)} tickers...")
+        log.info(f"Fetching prices for {len(all_tickers)} tickers...")
         prices = get_ibkr_prices(ib, all_tickers, yf_data=data)
 
         # Current dollar positions
@@ -420,6 +472,10 @@ def main():
         "--confirm-live", action="store_true",
         help="Skip interactive confirmation for live mode (for automation)"
     )
+    parser.add_argument(
+        "--hourly", action="store_true",
+        help="Use hourly bars from IBKR instead of daily from yfinance"
+    )
     args = parser.parse_args()
 
     if args.live:
@@ -433,12 +489,14 @@ def main():
             if confirm.strip().lower() != "yes":
                 print("Aborted.")
                 return
-        run_live(port, dry_run=False, capital=args.capital, force=args.force)
+        run_live(port, dry_run=False, capital=args.capital,
+                 force=args.force, hourly=args.hourly)
 
     elif args.paper:
         port = args.port or 4002
         log.info(f"Paper trading mode (port {port})")
-        run_live(port, dry_run=False, capital=args.capital, force=args.force)
+        run_live(port, dry_run=False, capital=args.capital,
+                 force=args.force, hourly=args.hourly)
 
     else:
         run_dry()
